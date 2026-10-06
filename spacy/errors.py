@@ -988,6 +988,10 @@ class Errors(metaclass=ErrorsWithCodes):
     E1057 = ("The `TextCatReduce` architecture must be used with at least one "
              "reduction. Please enable one of `use_reduce_first`, "
              "`use_reduce_last`, `use_reduce_max` or `use_reduce_mean`.")
+    E1058 = ("Couldn't add the pattern at index {index} to the '{component}' "
+             "component because it's invalid: {reason}")
+    E1059 = ("Either an 'ent_id' or a 'label' (or both) is required to "
+             "remove patterns from the '{component}' component.")
 
 
 # Deprecated model shortcuts, only used in errors and warnings

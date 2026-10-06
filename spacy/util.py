@@ -1,4 +1,5 @@
 import functools
+import hashlib
 import importlib
 import importlib.util
 import inspect
@@ -13,9 +14,13 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 import warnings
 from collections import defaultdict
 from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import (
@@ -69,7 +74,19 @@ from thinc.api import compounding, decaying, fix_random_seed  # noqa: F401
 
 from . import about
 from .compat import CudaStream, cupy, importlib_metadata, is_windows
-from .errors import OLD_MODEL_SHORTCUTS, Errors, Warnings
+from .errors import (
+    OLD_MODEL_SHORTCUTS,
+    ArtifactCommitError,
+    ArtifactCommitInterruptedError,
+    ArtifactError,  # noqa: F401  (public via spacy.util)
+    ArtifactIncompleteError,
+    ArtifactIntegrityError,
+    ArtifactLockError,
+    ArtifactSerializationError,
+    ArtifactVersionError,
+    Errors,
+    Warnings,
+)
 from .symbols import ORTH
 
 if TYPE_CHECKING:
@@ -1423,19 +1440,697 @@ def from_dict(
     return msg
 
 
+# ---------------------------------------------------------------------------
+# Transactional artifact storage
+#
+# Writes never touch the target directory directly. All items are serialized
+# into a private staging directory, validated against a manifest and then
+# committed as a whole (the manifest is published last). A directory-level
+# shared/exclusive lock ensures that cooperating readers either see the
+# complete old version or the complete new version, and that concurrent saves
+# to the same target are serialized (or rejected with an ArtifactLockError).
+#
+# On-disk layout (target = e.g. the model directory):
+#   <target>/<items...>                 same files/dirs as item-by-item writes
+#   <target>/.spacy-manifest.json       commit marker, version and checksums
+#   <parent>/.<name>.staging-<txid>/    draft area (removed after commit)
+#   <parent>/.<name>.backup-<txid>/     pre-commit backup (removed after commit)
+#   <parent>/.<name>.lock               advisory shared/exclusive lock
+#
+# Directories written before this mechanism have no manifest and continue to
+# be read item-by-item exactly as before (legacy mode).
+# ---------------------------------------------------------------------------
+ARTIFACT_MANIFEST_NAME = ".spacy-manifest.json"
+ARTIFACT_MANIFEST_VERSION = 1
+ARTIFACT_STAGING_PREFIX_TMPL = ".{name}.staging-"
+ARTIFACT_BACKUP_PREFIX_TMPL = ".{name}.backup-"
+ARTIFACT_LOCK_NAME_TMPL = ".{name}.lock"
+#: Maximum time (seconds) to wait for another process to release the artifact
+#: lock before rejecting the operation. Override with SPACY_ARTIFACT_LOCK_TIMEOUT.
+ARTIFACT_LOCK_TIMEOUT = 30.0
+_LOCK_POLL_INTERVAL = 0.05
+_HASH_CHUNK_SIZE = 1024 * 1024
+
+#: Resolved root of the currently active staging area. Nested to_disk calls
+#: writing below this root participate in the enclosing transaction instead
+#: of starting their own (e.g. Vectors.to_disk writing into the vocab item).
+_artifact_write_root: ContextVar[Optional[Path]] = ContextVar(
+    "spacy_artifact_write_root", default=None
+)
+#: Resolved root of a verified, locked read transaction. Nested from_disk
+#: calls below this root skip re-verification (the outer reader holds the
+#: shared lock and has already checked the manifest).
+_artifact_read_root: ContextVar[Optional[Path]] = ContextVar(
+    "spacy_artifact_read_root", default=None
+)
+
+
+def _artifact_lock_timeout() -> float:
+    try:
+        return float(
+            os.environ.get("SPACY_ARTIFACT_LOCK_TIMEOUT", ARTIFACT_LOCK_TIMEOUT)
+        )
+    except (TypeError, ValueError):
+        return float(ARTIFACT_LOCK_TIMEOUT)
+
+
+if os.name == "nt":  # Windows: shared/exclusive locks via LockFileEx
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class _OVERLAPPED(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.c_size_t),
+            ("InternalHigh", ctypes.c_size_t),
+            ("Offset", wintypes.DWORD),
+            ("OffsetHigh", wintypes.DWORD),
+            ("hEvent", wintypes.HANDLE),
+        ]
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.LockFileEx.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(_OVERLAPPED),
+    ]
+    _kernel32.LockFileEx.restype = wintypes.BOOL
+    _kernel32.UnlockFileEx.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(_OVERLAPPED),
+    ]
+    _kernel32.UnlockFileEx.restype = wintypes.BOOL
+    _WIN_LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
+    _WIN_LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
+
+    class _PlatformFileLock:
+        """A byte-range lock supporting shared and exclusive acquisition."""
+
+        def __init__(self, target: Path, exclusive: bool) -> None:
+            self.target = target
+            self.lock_path = target.parent / ARTIFACT_LOCK_NAME_TMPL.format(
+                name=target.name
+            )
+            self.exclusive = exclusive
+            self.fd: Optional[int] = None
+            self._overlapped: Optional["_OVERLAPPED"] = None
+
+        def acquire(self, timeout: float) -> None:
+            self.fd = os.open(str(self.lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+            handle = msvcrt.get_osfhandle(self.fd)
+            flags = _WIN_LOCKFILE_FAIL_IMMEDIATELY | (
+                _WIN_LOCKFILE_EXCLUSIVE_LOCK if self.exclusive else 0
+            )
+            deadline = time.monotonic() + timeout
+            while True:
+                overlapped = _OVERLAPPED()
+                if _kernel32.LockFileEx(
+                    handle, flags, 0, 1, 0, ctypes.byref(overlapped)
+                ):
+                    self._overlapped = overlapped
+                    return
+                if time.monotonic() >= deadline:
+                    os.close(self.fd)
+                    self.fd = None
+                    raise ArtifactLockError(
+                        Errors.E1058.format(path=self.target, timeout=timeout),
+                        path=self.target,
+                        code="E1058",
+                    )
+                time.sleep(_LOCK_POLL_INTERVAL)
+
+        def release(self) -> None:
+            if self.fd is not None:
+                handle = msvcrt.get_osfhandle(self.fd)
+                if self._overlapped is not None:
+                    _kernel32.UnlockFileEx(
+                        handle, 0, 1, 0, ctypes.byref(self._overlapped)
+                    )
+                os.close(self.fd)
+                self.fd = None
+
+else:  # POSIX: flock supports shared (LOCK_SH) and exclusive (LOCK_EX) locks
+    import fcntl
+
+    class _PlatformFileLock:
+        """An advisory flock supporting shared and exclusive acquisition."""
+
+        def __init__(self, target: Path, exclusive: bool) -> None:
+            self.target = target
+            self.lock_path = target.parent / ARTIFACT_LOCK_NAME_TMPL.format(
+                name=target.name
+            )
+            self.exclusive = exclusive
+            self.fd: Optional[int] = None
+
+        def acquire(self, timeout: float) -> None:
+            self.fd = os.open(str(self.lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+            flags = fcntl.LOCK_NB | (fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH)
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(self.fd, flags)
+                    return
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        os.close(self.fd)
+                        self.fd = None
+                        raise ArtifactLockError(
+                            Errors.E1058.format(path=self.target, timeout=timeout),
+                            path=self.target,
+                            code="E1058",
+                        )
+                    time.sleep(_LOCK_POLL_INTERVAL)
+
+        def release(self) -> None:
+            if self.fd is not None:
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(self.fd)
+                    self.fd = None
+
+
+@contextmanager
+def _artifact_lock(target: Path, exclusive: bool) -> Iterator[None]:
+    """Acquire the shared/exclusive lock guarding an artifact directory."""
+    lock = _PlatformFileLock(target, exclusive)
+    lock.acquire(_artifact_lock_timeout())
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _artifact_ignored_name(name: str) -> bool:
+    """Names excluded from tree checksums (transaction bookkeeping files)."""
+    return name == ARTIFACT_MANIFEST_NAME or (
+        name.startswith(".")
+        and (".staging-" in name or ".backup-" in name or name.endswith(".lock"))
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file_:
+        for chunk in iter(lambda: file_.read(_HASH_CHUNK_SIZE), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_tree(path: Path) -> str:
+    """Stable, content-defined checksum of a directory tree (git-tree-like)."""
+    digest = hashlib.sha256()
+    entries = sorted(os.scandir(path), key=lambda entry: entry.name)
+    for entry in entries:
+        if _artifact_ignored_name(entry.name):
+            continue
+        is_dir = entry.is_dir(follow_symlinks=False)
+        digest.update(b"D " if is_dir else b"F ")
+        digest.update(entry.name.encode("utf-8"))
+        digest.update(b"\0")
+        child = (
+            _sha256_tree(Path(entry.path)) if is_dir else _sha256_file(Path(entry.path))
+        )
+        digest.update(bytes.fromhex(child))
+    return digest.hexdigest()
+
+
+def _item_kind(path: Path) -> Optional[str]:
+    if path.is_dir():
+        return "dir"
+    if path.is_file():
+        return "file"
+    return None
+
+
+def _hash_item(path: Path, kind: str) -> str:
+    return _sha256_tree(path) if kind == "dir" else _sha256_file(path)
+
+
+def _build_manifest(root: Path, txid: str) -> Dict[str, Any]:
+    """Snapshot the staging directory and hash every entry from the bytes on
+    disk (not from memory), so files truncated during write cannot match a
+    checksum. Items are recorded by their actual on-disk names: a writer
+    receives a path for its logical key but may write elsewhere (e.g. the
+    "strings" writer writes "strings.json"), or write nothing at all (e.g.
+    empty vectors) - such items are simply absent from the snapshot, and
+    readers handle absent items themselves as they always have."""
+    items: Dict[str, Any] = {}
+    for entry in sorted(os.scandir(root), key=lambda entry: entry.name):
+        if _artifact_ignored_name(entry.name):
+            continue
+        item_path = Path(entry.path)
+        kind = "dir" if entry.is_dir(follow_symlinks=False) else "file"
+        items[entry.name] = {
+            "type": kind,
+            "sha256": _hash_item(item_path, kind),
+        }
+    return {
+        "manifest_version": ARTIFACT_MANIFEST_VERSION,
+        "spacy_version": about.__version__,
+        "created": datetime.now(timezone.utc).isoformat(),
+        "txid": txid,
+        "items": items,
+    }
+
+
+def _write_manifest(root: Path, manifest: Dict[str, Any]) -> None:
+    tmp_path = root / f"{ARTIFACT_MANIFEST_NAME}.tmp-{uuid.uuid4().hex}"
+    srsly.write_json(tmp_path, manifest, indent=2)
+    os.replace(tmp_path, root / ARTIFACT_MANIFEST_NAME)
+
+
+def _parse_manifest(target: Path, manifest_path: Path) -> Dict[str, Any]:
+    """Read and validate the manifest, raising typed errors for each distinct
+    failure mode."""
+    try:
+        manifest = srsly.json_loads(manifest_path.read_bytes())
+    except Exception as err:
+        raise ArtifactCommitInterruptedError(
+            Errors.E1064.format(path=target, reason=f"{type(err).__name__}: {err}"),
+            path=target,
+            code="E1064",
+        ) from err
+    if not isinstance(manifest, dict) or not isinstance(
+        manifest.get("manifest_version"), int
+    ):
+        raise ArtifactCommitInterruptedError(
+            Errors.E1064.format(
+                path=target, reason="the manifest is not a valid manifest object"
+            ),
+            path=target,
+            code="E1064",
+        )
+    found = manifest["manifest_version"]
+    if found > ARTIFACT_MANIFEST_VERSION:
+        reason = (
+            "The artifact was written with a newer manifest format, so this "
+            "reader is stale. Upgrade spaCy to read it."
+        )
+        kind = "artifact-newer"
+    elif found < ARTIFACT_MANIFEST_VERSION:
+        reason = (
+            "The artifact uses an older, no longer supported manifest format, "
+            "so the artifact itself is stale. Re-export it with a current "
+            "spaCy version."
+        )
+        kind = "artifact-older"
+    else:
+        return manifest
+    raise ArtifactVersionError(
+        Errors.E1059.format(
+            path=target,
+            found=found,
+            supported=ARTIFACT_MANIFEST_VERSION,
+            reason=reason,
+        ),
+        path=target,
+        code="E1059",
+        found=found,
+        supported=ARTIFACT_MANIFEST_VERSION,
+        kind=kind,
+    )
+
+
+def _verify_manifest(target: Path, manifest: Dict[str, Any]) -> None:
+    """Check that every recorded item exists with the right type and
+    checksum. Missing/wrong-typed items and checksum mismatches get different
+    exception types."""
+    items = manifest.get("items")
+    if not isinstance(items, dict):
+        raise ArtifactCommitInterruptedError(
+            Errors.E1064.format(
+                path=target, reason="the manifest has no 'items' table"
+            ),
+            path=target,
+            code="E1064",
+        )
+    for key, item_manifest in items.items():
+        item_path = target / key
+        expected_type = item_manifest.get("type")
+        if not item_path.exists() and not item_path.is_symlink():
+            raise ArtifactIncompleteError(
+                Errors.E1061.format(
+                    path=target,
+                    item=key,
+                    expected_type=expected_type,
+                ),
+                path=target,
+                code="E1061",
+                item=key,
+                expected_type=expected_type,
+                actual_type="missing",
+            )
+        actual_type = _item_kind(item_path)
+        if actual_type != expected_type:
+            raise ArtifactIncompleteError(
+                Errors.E1061.format(
+                    path=target,
+                    item=key,
+                    expected_type=expected_type,
+                ),
+                path=target,
+                code="E1061",
+                item=key,
+                expected_type=expected_type,
+                actual_type=actual_type,
+            )
+        actual_hash = _hash_item(item_path, actual_type)
+        expected_hash = item_manifest.get("sha256")
+        if actual_hash != expected_hash:
+            raise ArtifactIntegrityError(
+                Errors.E1060.format(
+                    path=target,
+                    item=key,
+                    expected=expected_hash,
+                    actual=actual_hash,
+                ),
+                path=target,
+                code="E1060",
+                item=key,
+                expected=expected_hash,
+                actual=actual_hash,
+            )
+
+
+def _artifact_markers(target: Path) -> Tuple[List[Path], List[Path]]:
+    """Return (staging dirs, backup dirs) left behind by previous transactions
+    for this target."""
+    if target.name:
+        staging_prefix = ARTIFACT_STAGING_PREFIX_TMPL.format(name=target.name)
+        backup_prefix = ARTIFACT_BACKUP_PREFIX_TMPL.format(name=target.name)
+    else:
+        staging_prefix = backup_prefix = ""
+    stagings: List[Path] = []
+    backups: List[Path] = []
+    if staging_prefix and target.parent.exists():
+        for entry in target.parent.iterdir():
+            if entry.name.startswith(staging_prefix) and entry.is_dir():
+                stagings.append(entry)
+            elif entry.name.startswith(backup_prefix) and entry.is_dir():
+                backups.append(entry)
+    return stagings, backups
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _committed_txid(target: Path) -> Optional[str]:
+    manifest_path = target / ARTIFACT_MANIFEST_NAME
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = srsly.json_loads(manifest_path.read_bytes())
+    except Exception:
+        return None
+    return manifest.get("txid") if isinstance(manifest, dict) else None
+
+
+def _recover_artifacts(target: Path) -> None:
+    """Resolve leftovers of transactions whose writer died mid-commit.
+
+    A backup whose txid matches the committed manifest is stale garbage (the
+    commit completed; only cleanup was missed). Any other backup means the
+    commit point was never reached, so the backed-up items are moved back to
+    restore the last complete version. Items the dead transaction was adding
+    for the first time (and that are therefore not in the backup) are removed
+    using the staging manifest. Staging dirs themselves were never visible
+    and are deleted afterwards. Must be called under the exclusive lock."""
+    stagings, backups = _artifact_markers(target)
+    current_txid = _committed_txid(target) if target.exists() else None
+    current_manifest: Optional[Dict[str, Any]] = None
+    if target.exists() and (target / ARTIFACT_MANIFEST_NAME).exists():
+        try:
+            current_manifest = srsly.json_loads(
+                (target / ARTIFACT_MANIFEST_NAME).read_bytes()
+            )
+        except Exception:
+            current_manifest = None
+    current_items = set(
+        current_manifest.get("items", {}).keys()
+        if isinstance(current_manifest, dict)
+        else []
+    )
+    restored: Set[str] = set()
+    for backup in backups:
+        txid = backup.name.rsplit("-", 1)[-1]
+        if current_txid is not None and txid == current_txid:
+            shutil.rmtree(backup, ignore_errors=True)
+            continue
+        try:
+            if not target.exists():
+                target.mkdir(parents=True, exist_ok=True)
+            # Restore items first, manifest last so a reader never observes a
+            # manifest describing a half-restored tree.
+            entries = sorted(
+                backup.iterdir(),
+                key=lambda entry: entry.name == ARTIFACT_MANIFEST_NAME,
+            )
+            for entry in entries:
+                dest = target / entry.name
+                if dest.exists() or dest.is_symlink():
+                    _remove_path(dest)
+                os.replace(entry, dest)
+                restored.add(entry.name)
+        except OSError as err:
+            raise ArtifactCommitInterruptedError(
+                Errors.E1062.format(
+                    path=target,
+                    detail=f"unresolved backup '{backup.name}'",
+                    reason=str(err),
+                ),
+                path=target,
+                code="E1062",
+            ) from err
+        shutil.rmtree(backup, ignore_errors=True)
+    for staging in stagings:
+        # Remove half-published items the dead transaction was adding for the
+        # first time: they were never committed, so they are neither part of
+        # a restored backup nor of the currently committed manifest.
+        try:
+            staged_manifest = srsly.json_loads(
+                (staging / ARTIFACT_MANIFEST_NAME).read_bytes()
+            )
+            staged_items = staged_manifest.get("items", {})
+            if target.exists() and isinstance(staged_items, dict):
+                for name in staged_items:
+                    dest = target / name
+                    if (
+                        name not in restored
+                        and name not in current_items
+                        and (dest.exists() or dest.is_symlink())
+                    ):
+                        _remove_path(dest)
+        except Exception:
+            pass
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _commit_artifacts(
+    target: Path, staging: Path, item_names: List[str], txid: str
+) -> None:
+    """Publish the validated staging directory as one transaction.
+
+    For a new target the whole directory is renamed into place atomically.
+    For an existing target each replaced item is parked in a backup directory
+    and the manifest is published last; on any failure everything is moved
+    back so the target contains the complete previous version. Items the new
+    write does not produce are left untouched (matching the legacy
+    item-by-item behavior)."""
+    if not target.exists():
+        # Same-directory rename: atomic on POSIX and Windows, and the
+        # manifest travels with the directory.
+        os.replace(staging, target)
+        return
+    backup = target.parent / (
+        ARTIFACT_BACKUP_PREFIX_TMPL.format(name=target.name) + txid
+    )
+    backup.mkdir()
+    names = list(item_names) + [ARTIFACT_MANIFEST_NAME]
+    moved_out: List[str] = []
+    moved_in: List[str] = []
+    try:
+        # Phase 1: park the previous versions (old manifest first).
+        for name in names:
+            old_path = target / name
+            if old_path.exists() or old_path.is_symlink():
+                os.replace(old_path, backup / name)
+                moved_out.append(name)
+        # Phase 2: move the new items into place.
+        for name in item_names:
+            os.replace(staging / name, target / name)
+            moved_in.append(name)
+        # Phase 3: the commit point - publish the new manifest last.
+        os.replace(staging / ARTIFACT_MANIFEST_NAME, target / ARTIFACT_MANIFEST_NAME)
+    except OSError as err:
+        # Roll back: discard new items, restore old ones, manifest last.
+        for name in moved_in:
+            new_path = target / name
+            if new_path.exists() or new_path.is_symlink():
+                _remove_path(new_path)
+        for name in moved_out:
+            if name == ARTIFACT_MANIFEST_NAME:
+                continue
+            old_path = backup / name
+            if old_path.exists() or old_path.is_symlink():
+                dest = target / name
+                if dest.exists() or dest.is_symlink():
+                    _remove_path(dest)
+                os.replace(old_path, dest)
+        if ARTIFACT_MANIFEST_NAME in moved_out:
+            dest = target / ARTIFACT_MANIFEST_NAME
+            if dest.exists():
+                _remove_path(dest)
+            os.replace(backup / ARTIFACT_MANIFEST_NAME, dest)
+        shutil.rmtree(backup, ignore_errors=True)
+        raise ArtifactCommitError(
+            Errors.E1065.format(path=target, reason=str(err)),
+            path=target,
+            code="E1065",
+        ) from err
+    except BaseException:
+        # Roll back for non-OS failures too (e.g. KeyboardInterrupt), then
+        # preserve the original exception type.
+        for name in moved_in:
+            new_path = target / name
+            if new_path.exists() or new_path.is_symlink():
+                _remove_path(new_path)
+        for name in moved_out:
+            if name == ARTIFACT_MANIFEST_NAME:
+                continue
+            old_path = backup / name
+            if old_path.exists() or old_path.is_symlink():
+                dest = target / name
+                if dest.exists() or dest.is_symlink():
+                    _remove_path(dest)
+                os.replace(old_path, dest)
+        if ARTIFACT_MANIFEST_NAME in moved_out:
+            dest = target / ARTIFACT_MANIFEST_NAME
+            if dest.exists():
+                _remove_path(dest)
+            os.replace(backup / ARTIFACT_MANIFEST_NAME, dest)
+        shutil.rmtree(backup, ignore_errors=True)
+        raise
+    shutil.rmtree(backup, ignore_errors=True)
+
+
 def to_disk(
     path: Union[str, Path],
     writers: Dict[str, Callable[[Path], None]],
     exclude: Iterable[str],
 ) -> Path:
-    path = ensure_path(path)
-    if not path.exists():
-        path.mkdir()
-    for key, writer in writers.items():
+    """Serialize artifacts to a directory transactionally.
+
+    All writers run into a private staging directory; the staged items are
+    checksummed into a manifest and re-validated, after which the whole
+    transaction is committed to the target directory (manifest last). If a
+    writer fails, the target is never touched; if the commit fails, the target
+    is rolled back to its previous complete state. Concurrent saves to the
+    same target are serialized with a directory lock; a save that cannot
+    acquire the lock in time fails with an ArtifactLockError without touching
+    the target.
+
+    Nested to_disk calls that write below an active staging area participate
+    in the enclosing transaction instead of starting a new one.
+
+    path (str / Path): Path to a directory, which will be created if it
+        doesn't exist.
+    writers (Dict[str, Callable[[Path], None]]): Serializers keyed by item
+        name, called with the path to write each item to.
+    exclude (Iterable[str]): Names of items to skip.
+    RETURNS (Path): The resolved target path.
+    """
+    path = ensure_path(path).resolve()
+    write_root = _artifact_write_root.get()
+    if write_root is not None and _is_relative_to(path, write_root):
+        # Inside an active transaction: write directly, the outer call
+        # validates and commits atomically.
+        path.mkdir(parents=True, exist_ok=True)
+        for key, writer in writers.items():
+            # Split to support file names like meta.json
+            if key.split(".")[0] not in exclude:
+                writer(path / key)
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _artifact_lock(path, exclusive=True):
+        # Finish or undo transactions of writers that died previously.
+        _recover_artifacts(path)
+        txid = uuid.uuid4().hex
+        staging = path.parent / (
+            ARTIFACT_STAGING_PREFIX_TMPL.format(name=path.name) + txid
+        )
+        staging.mkdir()
+        staging_root = staging.resolve()
+        keys: List[str] = []
+        write_token = _artifact_write_root.set(staging_root)
+        try:
+            for key, writer in writers.items():
+                # Split to support file names like meta.json
+                if key.split(".")[0] not in exclude:
+                    keys.append(key)
+                    writer(staging / key)
+            # All serialization succeeded: build the manifest from the bytes
+            # actually on disk, publish it inside the staging area and verify
+            # the staging area against the manifest before committing.
+            manifest = _build_manifest(staging, txid)
+            _write_manifest(staging, manifest)
+            staged_manifest = _parse_manifest(staging, staging / ARTIFACT_MANIFEST_NAME)
+            try:
+                # Independent re-read of the draft: a failure here is a
+                # writer-side failure before the commit point, never an
+                # artifact-side integrity problem.
+                _verify_manifest(staging, staged_manifest)
+            except ArtifactError as err:
+                raise ArtifactSerializationError(
+                    Errors.E1063.format(
+                        path=staging,
+                        reason=(
+                            f"validation of staged item '{err.details.get('item')}' "
+                            f"failed ({type(err).__name__})."
+                        ),
+                    ),
+                    path=staging,
+                    code="E1063",
+                    details=err.details,
+                ) from err
+            _commit_artifacts(path, staging, list(manifest["items"].keys()), txid)
+        finally:
+            _artifact_write_root.reset(write_token)
+            # After a successful rename the staging path no longer exists;
+            # after a merge commit it is an empty directory. Either way make
+            # sure no draft is left behind next to the target.
+            shutil.rmtree(staging, ignore_errors=True)
+    return path
+
+
+def _dispatch_readers(
+    path: Path,
+    readers: Dict[str, Callable[[Path], None]],
+    exclude: Iterable[str],
+) -> None:
+    for key, reader in readers.items():
         # Split to support file names like meta.json
         if key.split(".")[0] not in exclude:
-            writer(path / key)
-    return path
+            reader(path / key)
 
 
 def from_disk(
@@ -1443,11 +2138,53 @@ def from_disk(
     readers: Dict[str, Callable[[Path], None]],
     exclude: Iterable[str],
 ) -> Path:
-    path = ensure_path(path)
-    for key, reader in readers.items():
-        # Split to support file names like meta.json
-        if key.split(".")[0] not in exclude:
-            reader(path / key)
+    """Load artifacts from a directory with integrity verification.
+
+    Directories with a manifest are verified before any reader runs: manifest
+    version mismatches raise ArtifactVersionError, missing items raise
+    ArtifactIncompleteError and checksum mismatches raise
+    ArtifactIntegrityError. These are distinct from reading a legacy
+    directory (no manifest), which keeps the previous item-by-item behavior
+    unchanged. A shared lock blocks readers while a writer is committing, so
+    readers always observe a complete old or complete new version.
+
+    path (str / Path): A path to a directory.
+    readers (Dict[str, Callable[[Path], None]]): Deserializers keyed by item
+        name, called with the path to read each item from.
+    exclude (Iterable[str]): Names of items to skip.
+    RETURNS (Path): The resolved target path.
+    """
+    path = ensure_path(path).resolve()
+    read_root = _artifact_read_root.get()
+    if read_root is not None and _is_relative_to(path, read_root):
+        # Outer reader holds the lock and has verified everything.
+        _dispatch_readers(path, readers, exclude)
+        return path
+    if not path.exists():
+        # Nothing committed here: behave exactly like the legacy reader.
+        _dispatch_readers(path, readers, exclude)
+        return path
+    # Leftover backup directories mean a previous commit may have been
+    # interrupted: take the exclusive lock briefly and recover (this also
+    # waits for a commit that is currently in progress).
+    _, backups = _artifact_markers(path)
+    exclusive = bool(backups)
+    with _artifact_lock(path, exclusive=exclusive):
+        if exclusive:
+            _recover_artifacts(path)
+        manifest_path = path / ARTIFACT_MANIFEST_NAME
+        if not manifest_path.exists():
+            # Legacy artifact (written without transactions): read exactly
+            # as before, without verification.
+            _dispatch_readers(path, readers, exclude)
+            return path
+        manifest = _parse_manifest(path, manifest_path)
+        _verify_manifest(path, manifest)
+        token = _artifact_read_root.set(path)
+        try:
+            _dispatch_readers(path, readers, exclude)
+        finally:
+            _artifact_read_root.reset(token)
     return path
 
 

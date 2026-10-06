@@ -2135,6 +2135,12 @@ class Language:
         """Save the current state to a directory.  If a model is loaded, this
         will include the model.
 
+        The save is transactional: all items are written to a staging
+        directory, checksummed into a manifest and only then committed as a
+        whole. A failed or interrupted save leaves the previous complete
+        version in place, and concurrent saves are serialized via a directory
+        lock.
+
         path (str / Path): Path to a directory, which will be created if
             it doesn't exist.
         exclude (Iterable[str]): Names of components or serialization fields to exclude.
@@ -2204,6 +2210,11 @@ class Language:
         """Loads state from a directory. Modifies the object in place and
         returns it. If the saved `Language` object contains a model, the
         model will be loaded.
+
+        Directories carrying a manifest are verified before anything is read:
+        version mismatches, missing items and checksum mismatches raise
+        distinct, diagnostic errors. Directories without a manifest (artifacts
+        written by older spaCy versions) continue to be read item-by-item.
 
         path (str / Path): A path to a directory.
         exclude (Iterable[str]): Names of components or serialization fields to exclude.

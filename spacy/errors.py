@@ -988,6 +988,47 @@ class Errors(metaclass=ErrorsWithCodes):
     E1057 = ("The `TextCatReduce` architecture must be used with at least one "
              "reduction. Please enable one of `use_reduce_first`, "
              "`use_reduce_last`, `use_reduce_max` or `use_reduce_mean`.")
+    E1058 = ("Could not acquire the artifact lock for '{path}' within "
+             "{timeout:.1f} seconds. Another writer is currently committing to "
+             "this directory. The operation was rejected before anything was "
+             "written, so the existing artifacts are untouched. Serialize the "
+             "concurrent saves (retry later) or save to a different directory.")
+    E1059 = ("Artifact manifest version mismatch in '{path}': the manifest "
+             "uses version v{found}, but this spaCy version supports v"
+             "{supported}. {reason}")
+    E1060 = ("Artifact integrity check failed in '{path}': the checksum of "
+             "'{item}' does not match the manifest (expected {expected}, got "
+             "{actual}). This is a problem with the artifact itself: it was "
+             "corrupted, partially copied or modified after the write "
+             "committed, not a problem with the writer. Re-export or restore "
+             "the artifact from an intact source. A legacy directory without "
+             "a manifest is read without checks instead of raising this "
+             "error.")
+    E1061 = ("The artifact in '{path}' is incomplete: '{item}' is recorded in "
+             "the manifest as a {expected_type} but is missing or has the "
+             "wrong type on disk. This is a writer-side or transport failure "
+             "(an interrupted write/commit or an incomplete copy); the "
+             "artifact is not merely in an older format. Re-save or re-copy "
+             "the artifact. A legacy directory without a manifest is read "
+             "item-by-item instead of raising this error.")
+    E1062 = ("Found evidence of an interrupted artifact commit in '{path}' "
+             "({detail}). The previous writer failed or was killed before the "
+             "commit point. spaCy attempted to roll the directory back to the "
+             "last complete version automatically, but could not: {reason}")
+    E1063 = ("Artifact serialization failed before the commit point while "
+             "preparing '{path}': {reason} No data was written to the target "
+             "directory, which still contains the previous complete version.")
+    E1064 = ("Could not read the artifact manifest in '{path}': {reason}. The "
+             "manifest is the commit marker, so an unreadable or truncated "
+             "manifest means the writer was interrupted while committing or "
+             "the artifact was copied incompletely (writer/transport "
+             "failure), not that the artifact is in an older format. A "
+             "legacy directory without a manifest is read item-by-item "
+             "instead of raising this error.")
+    E1065 = ("Failed to commit the staged artifacts to '{path}': {reason} All "
+             "changes were rolled back and the directory still contains the "
+             "previous complete version (or no version at all). This is a "
+             "writer-side failure, not a stale artifact.")
 
 
 # Deprecated model shortcuts, only used in errors and warnings
@@ -1015,3 +1056,118 @@ class MatchPatternError(ValueError):
             pattern_errors = "\n".join([f"- {e}" for e in error_msgs])
             msg += f"\nPattern {pattern_idx}:\n{pattern_errors}\n"
         ValueError.__init__(self, msg)
+
+
+class ArtifactError(ValueError):
+    """Base class for errors raised by the transactional artifact storage
+    (``spacy.util.to_disk`` / ``spacy.util.from_disk``). Each concrete subclass
+    corresponds to a distinct failure mode, so callers can distinguish a
+    writer-side failure, a stale artifact and an unsupported manifest version
+    instead of receiving one generic error.
+
+    path (str / Path): The artifact directory the error relates to.
+    code (str): The ``Errors.E*`` code used for the message.
+    details (dict): Structured diagnostics for the failure.
+    """
+
+    def __init__(self, message, *, path=None, code=None, details=None):
+        self.path = str(path) if path is not None else None
+        self.code = code
+        self.details = dict(details) if details else {}
+        ValueError.__init__(self, message)
+
+
+class ArtifactVersionError(ArtifactError):
+    """Raised when the on-disk manifest has a manifest version that this
+    spaCy version cannot read. ``kind`` is "artifact-newer" when the artifact
+    was written by a newer spaCy (the reader is stale) and "artifact-older"
+    when the artifact predates the supported manifest format (the artifact is
+    stale)."""
+
+    def __init__(
+        self, message, *, path=None, code=None, found=None, supported=None, kind=None
+    ):
+        super().__init__(
+            message,
+            path=path,
+            code=code,
+            details={"found": found, "supported": supported, "kind": kind},
+        )
+        self.found = found
+        self.supported = supported
+        self.kind = kind
+
+
+class ArtifactIntegrityError(ArtifactError):
+    """Raised when an item's checksum no longer matches the manifest. The
+    commit completed, so this indicates a corrupted, partially copied or
+    modified artifact (a problem with the artifact itself), not a writer
+    failure."""
+
+    def __init__(
+        self, message, *, path=None, code=None, item=None, expected=None, actual=None
+    ):
+        super().__init__(
+            message,
+            path=path,
+            code=code,
+            details={"item": item, "expected": expected, "actual": actual},
+        )
+        self.item = item
+        self.expected = expected
+        self.actual = actual
+
+
+class ArtifactIncompleteError(ArtifactError):
+    """Raised when a manifest item is missing or has the wrong type on disk.
+    This means the write or a subsequent copy was interrupted/transport failed
+    (writer-side failure), which is distinct from both a checksum mismatch and
+    a legacy directory without a manifest."""
+
+    def __init__(
+        self,
+        message,
+        *,
+        path=None,
+        code=None,
+        item=None,
+        expected_type=None,
+        actual_type=None,
+    ):
+        super().__init__(
+            message,
+            path=path,
+            code=code,
+            details={
+                "item": item,
+                "expected_type": expected_type,
+                "actual_type": actual_type,
+            },
+        )
+        self.item = item
+        self.expected_type = expected_type
+        self.actual_type = actual_type
+
+
+class ArtifactCommitInterruptedError(ArtifactIncompleteError):
+    """Raised when a half-finished transaction is found (commit markers left
+    by a killed writer) and it cannot be rolled back automatically. This is
+    always a writer-side failure."""
+
+
+class ArtifactSerializationError(ArtifactError):
+    """Raised when serialization or validation fails in the staging area,
+    before the commit point. The target directory is never modified. This is a
+    writer-side failure."""
+
+
+class ArtifactCommitError(ArtifactError):
+    """Raised when the atomic commit itself fails after staging succeeded.
+    The target directory is rolled back to its previous complete state. This
+    is a writer-side/environment failure."""
+
+
+class ArtifactLockError(ArtifactError):
+    """Raised when the lock for an artifact directory cannot be acquired in
+    time, e.g. because another writer is currently committing to the same
+    directory. The rejected operation never touches the target directory."""

@@ -7,7 +7,7 @@ from thinc.api import Config, Model, Optimizer, set_dropout_rate
 
 from ..errors import Errors
 from ..language import Language
-from ..scorer import Scorer
+from ..scorer import Scorer, scorer_with_state
 from ..tokens import Doc
 from ..training import Example, validate_examples, validate_get_examples
 from ..vocab import Vocab
@@ -73,6 +73,7 @@ subword_features = true
 """
 
 
+@scorer_with_state
 def textcat_score(examples: Iterable[Example], **kwargs) -> Dict[str, Any]:
     return Scorer.score_cats(
         examples,

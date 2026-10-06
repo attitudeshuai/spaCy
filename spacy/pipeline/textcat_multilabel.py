@@ -6,7 +6,7 @@ from thinc.api import Config, Model
 
 from ..errors import Errors
 from ..language import Language
-from ..scorer import Scorer
+from ..scorer import Scorer, scorer_with_state
 from ..training import Example, validate_get_examples
 from ..vocab import Vocab
 from .textcat import TextCategorizer
@@ -70,7 +70,10 @@ subword_features = true
 """
 
 
-def textcat_multilabel_score(examples: Iterable[Example], **kwargs) -> Dict[str, Any]:
+@scorer_with_state
+def textcat_multilabel_score(
+    examples: Iterable[Example], **kwargs
+) -> Dict[str, Any]:
     return Scorer.score_cats(
         examples,
         "cats",

@@ -11,7 +11,7 @@ from ..tokens.doc cimport Doc
 from .. import util
 from ..errors import Errors
 from ..language import Language
-from ..scorer import Scorer
+from ..scorer import Scorer, scorer_with_state
 from ..training import validate_examples, validate_get_examples
 from ..util import registry
 from .tagger import Tagger
@@ -36,10 +36,17 @@ subword_features = true
 DEFAULT_SENTER_MODEL = Config().from_str(default_model_config)["model"]
 
 
+@scorer_with_state
 def senter_score(examples, **kwargs):
     def has_sents(doc):
         return doc.has_annotation("SENT_START")
 
+    if kwargs.get("_state"):
+        component = Scorer.score_spans(
+            examples, "sents", has_annotation=has_sents, **kwargs
+        )
+        component["parts"][0]["scores"].pop("sents_per_type", None)
+        return component
     results = Scorer.score_spans(examples, "sents", has_annotation=has_sents, **kwargs)
     del results["sents_per_type"]
     return results

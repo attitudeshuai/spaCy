@@ -152,6 +152,10 @@ class JapaneseTokenizer(DummyTokenizer):
         validate_examples(examples, "JapaneseTokenizer.score")
         return Scorer.score_tokenization(examples)
 
+    def score_state(self, examples, **kwargs):
+        validate_examples(examples, "JapaneseTokenizer.score_state")
+        return Scorer.score_tokenization(examples, _state=True)
+
     def _get_config(self) -> Dict[str, Any]:
         return {"split_mode": self.split_mode}
 

@@ -138,6 +138,10 @@ class ChineseTokenizer(DummyTokenizer):
         validate_examples(examples, "ChineseTokenizer.score")
         return Scorer.score_tokenization(examples)
 
+    def score_state(self, examples, **kwargs):
+        validate_examples(examples, "ChineseTokenizer.score_state")
+        return Scorer.score_tokenization(examples, _state=True)
+
     def _get_config(self) -> Dict[str, Any]:
         return {
             "segmenter": self.segmenter,

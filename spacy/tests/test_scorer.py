@@ -1,12 +1,24 @@
+import uuid
+
 import pytest
 from numpy.testing import assert_almost_equal, assert_array_almost_equal
 from pytest import approx
 
 from spacy.lang.en import English
-from spacy.scorer import PRFScore, ROCAUCScore, Scorer, _roc_auc_score, _roc_curve
+from spacy.scorer import (
+    PRFScore,
+    ROCAUCScore,
+    STATE_VERSION,
+    Scorer,
+    ScorerState,
+    _roc_auc_score,
+    _roc_curve,
+)
 from spacy.tokens import Doc, Span
 from spacy.training import Example
 from spacy.training.iob_utils import offsets_to_biluo_tags
+
+from .util import make_tempdir
 
 test_las_apple = [
     [
@@ -488,6 +500,412 @@ def test_prf_score():
     assert (a.precision, a.recall, a.fscore) == approx(
         (c.precision, c.recall, c.fscore)
     )
+
+
+@pytest.fixture
+def rich_nlp():
+    nlp = English()
+    for factory in ("tagger", "morphologizer", "parser", "ner", "textcat", "spancat"):
+        nlp.add_pipe(factory)
+    for label in ("NN", "NNS", "VBZ"):
+        nlp.get_pipe("tagger").add_label(label)
+    for label in ("nsubj", "ROOT", "cc", "dobj"):
+        nlp.get_pipe("parser").add_label(label)
+    for label in ("PERSON", "ORG", "GPE"):
+        nlp.get_pipe("ner").add_label(label)
+    nlp.get_pipe("textcat").add_label("L1")
+    nlp.get_pipe("textcat").add_label("L2")
+    nlp.get_pipe("spancat").add_label("SP1")
+    nlp.get_pipe("spancat").add_label("SP2")
+    return nlp
+
+
+def _make_rich_example(nlp, words, *, gold, pred=None):
+    doc = Doc(nlp.vocab, words=words, spaces=[True] * (len(words) - 1) + [False])
+    eg = Example.from_dict(doc, gold)
+    if pred is not None:
+        pred_doc = eg.predicted
+        if "sent_starts" in pred:
+            for token, value in zip(pred_doc, pred["sent_starts"]):
+                token.is_sent_start = value
+        if "tags" in pred:
+            for token, tag in zip(pred_doc, pred["tags"]):
+                token.tag_ = tag
+        if "deps" in pred:
+            for token, (dep, head_i) in zip(pred_doc, pred["deps"]):
+                token.dep_ = dep
+                token.head = pred_doc[head_i]
+        if "cats" in pred:
+            pred_doc.cats = dict(pred["cats"])
+        if "ents" in pred:
+            pred_doc.ents = [
+                Span(pred_doc, start, end, label=label)
+                for start, end, label in pred["ents"]
+            ]
+        if "spans" in pred:
+            for key, spans in pred["spans"].items():
+                pred_doc.spans[key] = [
+                    Span(pred_doc, start, end, label=label)
+                    for start, end, label in spans
+                ]
+    return eg
+
+
+@pytest.fixture
+def rich_examples(rich_nlp):
+    examples = []
+    examples.append(
+        _make_rich_example(
+            rich_nlp,
+            ["Sarah", "likes", "cats"],
+            gold={
+                "tags": ["NNP", "VBZ", "NNS"],
+                "pos": ["PROPN", "VERB", "NOUN"],
+                "morphs": ["", "Tense=pres", "Number=plur"],
+                "lemmas": ["Sarah", "like", "cat"],
+                "heads": [1, 1, 1],
+                "deps": ["nsubj", "ROOT", "dobj"],
+                "sent_starts": [True, False, False],
+                "entities": [[0, 5, "PERSON"]],
+                "cats": {"L1": 1.0, "L2": 0.0},
+                "spans": {"sc": [[0, 5, "SP1"]]},
+            },
+            pred={
+                "tags": ["NNP", "VBZ", "NN"],
+                "deps": [("nsubj", 1), ("ROOT", 1), ("nsubj", 1)],
+                "sent_starts": [True, False, False],
+                "cats": {"L1": 0.7, "L2": 0.3},
+                "ents": [(0, 1, "PERSON")],
+                "spans": {"sc": [(0, 1, "SP1")]},
+            },
+        )
+    )
+    examples.append(
+        _make_rich_example(
+            rich_nlp,
+            ["John", "and", "Mary", "walked"],
+            gold={
+                "tags": ["NNP", "CC", "NNP", "VBD"],
+                "heads": [3, 0, 3, 3],
+                "deps": ["nsubj", "cc", "nsubj", "ROOT"],
+                "sent_starts": [True, False, False, False],
+                "entities": [[0, 4, "PERSON"], [9, 13, "PERSON"]],
+                "cats": {"L1": 0.0, "L2": 1.0},
+            },
+            pred={
+                "tags": ["NNP", "CC", "NN", "VBD"],
+                "deps": [
+                    ("nsubj", 3),
+                    ("cc", 0),
+                    ("nsubj", 3),
+                    ("ROOT", 3),
+                ],
+                "sent_starts": [True, False, False, False],
+                "cats": {"L1": 0.3, "L2": 0.7},
+                "ents": [(0, 1, "PERSON"), (2, 3, "ORG")],
+            },
+        )
+    )
+    examples.append(
+        _make_rich_example(
+            rich_nlp,
+            ["Google", "buys", "firms"],
+            gold={
+                "tags": ["NNP", "VBZ", "NNS"],
+                "heads": [1, 1, 1],
+                "deps": ["nsubj", "ROOT", "dobj"],
+                "sent_starts": [True, False, False],
+                "entities": [[0, 6, "ORG"]],
+                "cats": {"L1": 1.0, "L2": 0.0},
+                "spans": {"sc": [[0, 6, "SP2"]]},
+            },
+            pred={
+                "tags": ["NN", "VBZ", "NNS"],
+                "deps": [("nsubj", 1), ("ROOT", 1), ("dobj", 1)],
+                "sent_starts": [True, False, False],
+                "cats": {"L1": 0.4, "L2": 0.6},
+                "ents": [],
+                "spans": {"sc": [(0, 1, "SP1")]},
+            },
+        )
+    )
+    examples.append(
+        _make_rich_example(
+            rich_nlp,
+            ["A", "small", "sentence"],
+            gold={
+                "tags": ["DT", "JJ", "NN"],
+                "heads": [2, 2, 2],
+                "deps": ["det", "amod", "ROOT"],
+                "sent_starts": [True, False, False],
+                "cats": {"L1": 0.0, "L2": 1.0},
+                "spans": {"sc": [[8, 16, "SP1"]]},
+            },
+            pred={
+                "tags": ["DT", "JJ", "NN"],
+                "deps": [("det", 2), ("amod", 2), ("ROOT", 2)],
+                "sent_starts": [True, False, False],
+                "cats": {"L1": 0.1, "L2": 0.9},
+                "spans": {"sc": [(2, 3, "SP1")]},
+            },
+        )
+    )
+    examples.append(
+        _make_rich_example(
+            rich_nlp,
+            ["London", "is", "big"],
+            gold={
+                "tags": ["NNP", "VBZ", "JJ"],
+                "heads": [0, 0, 0],
+                "deps": ["ROOT", "aux", "amod"],
+                "sent_starts": [True, False, False],
+                "entities": [[0, 6, "GPE"]],
+                "cats": {"L1": 1.0, "L2": 0.0},
+            },
+            pred={
+                "tags": ["NNP", "VBZ", "JJ"],
+                "deps": [("ROOT", 0), ("aux", 0), ("amod", 0)],
+                "sent_starts": [True, False, False],
+                "cats": {"L1": 0.8, "L2": 0.2},
+                "ents": [(0, 1, "GPE")],
+            },
+        )
+    )
+    return rich_nlp, examples
+
+
+def test_scorer_state_finalize_matches_score(rich_examples):
+    nlp, examples = rich_examples
+    scorer = Scorer(nlp=nlp)
+    # a fresh state finalized directly produces the same scores as score()
+    state = scorer.accumulate(examples)
+    assert state.finalize() == scorer.score(examples)
+    assert state.finalize(per_component=True) == scorer.score(
+        examples, per_component=True
+    )
+
+
+def test_scorer_state_merge_equals_full(rich_examples):
+    nlp, examples = rich_examples
+    scorer = Scorer(nlp=nlp)
+    full = scorer.score(examples)
+    shard_subsets = [examples[:2], examples[2:3], examples[3:]]
+    states = [scorer.accumulate(subset) for subset in shard_subsets]
+    merged = ScorerState.merge(states).finalize()
+    assert set(merged.keys()) == set(full.keys())
+    # all covered keys are derived from counts with consistent label order,
+    # so merged scores are exactly equal to a single full evaluation
+    for key in full:
+        assert merged[key] == full[key], key
+
+
+def test_scorer_state_merge_order_independent(rich_examples):
+    nlp, examples = rich_examples
+    scorer = Scorer(nlp=nlp)
+    subsets = [examples[:2], examples[2:3], examples[3:]]
+    orders = [
+        [0, 1, 2],
+        [2, 0, 1],
+        [1, 2, 0],
+    ]
+    results = []
+    for order in orders:
+        states = [scorer.accumulate(subsets[i]) for i in order]
+        results.append(ScorerState.merge(states).finalize())
+    for result in results[1:]:
+        assert result == results[0]
+
+
+def test_scorer_state_duplicate_rejected(rich_examples):
+    nlp, examples = rich_examples
+    scorer = Scorer(nlp=nlp)
+    s1 = scorer.accumulate(examples[:2])
+    s2 = scorer.accumulate(examples[2:])
+    with pytest.raises(ValueError):
+        ScorerState.merge([s1, s2, s1])
+
+
+def test_scorer_state_pipeline_mismatch(rich_examples):
+    nlp, examples = rich_examples
+    scorer = Scorer(nlp=nlp)
+    s1 = scorer.accumulate(examples[:2])
+    s2 = ScorerState(states=s1.states, pipeline=["other", "pipes"], cfg={})
+    with pytest.raises(ValueError):
+        ScorerState.merge([s1, s2])
+
+
+def test_scorer_state_cfg_mismatch():
+    nlp = English()
+    text = "some text"
+    gold = nlp.make_doc(text)
+    gold.cats = {"A": 1.0, "B": 0.0}
+    pred = nlp.make_doc(text)
+    pred.cats = {"A": 0.7, "B": 0.3}
+    eg = Example(pred, gold)
+    s1 = Scorer.score_cats(
+        [eg], "cats", labels=["A", "B"], multi_label=False, _state=True
+    )
+    s2 = Scorer.score_cats(
+        [eg], "cats", labels=["A", "C"], multi_label=False, _state=True
+    )
+    with pytest.raises(ValueError):
+        ScorerState.merge(
+            [ScorerState.from_dict(_state_with_parts(s1)),
+             ScorerState.from_dict(_state_with_parts(s2))]
+        )
+
+
+def _state_with_parts(component_state, pipeline=["textcat"], cfg=None):
+    return {
+        "version": STATE_VERSION,
+        "id": uuid.uuid4().hex,
+        "pipeline": pipeline,
+        "cfg": cfg or {},
+        "canonical": False,
+        "states": {"textcat": component_state},
+    }
+
+
+def test_scorer_state_empty_semantics(rich_nlp):
+    scorer = Scorer(nlp=rich_nlp)
+    empty = scorer.accumulate([]).finalize()
+    # None semantics are preserved for counts-based keys, not turned into 0
+    assert empty["token_acc"] is None
+    assert empty["token_p"] is None
+    assert empty["tag_acc"] is None
+    assert empty["pos_acc"] is None
+    assert empty["morph_acc"] is None
+    assert empty["morph_per_feat"] is None
+    assert Scorer.score_token_attr([], "lemma")["lemma_acc"] is None
+    assert empty["dep_uas"] is None
+    assert empty["dep_las"] is None
+    assert empty["dep_las_per_type"] is None
+    assert empty["ents_p"] is None
+    assert empty["ents_per_type"] is None
+    assert empty["sents_p"] is None
+    assert empty["spans_sc_p"] is None
+    # cats keep the existing semantics where empty data scores as 0.0
+    assert empty["cats_score"] == 0.0
+    assert empty["cats_micro_f"] == 0.0
+    assert empty["cats_macro_f"] == 0.0
+    assert empty["cats_auc_per_type"] == {"L1": None, "L2": None}
+
+
+def test_scorer_state_links_empty_semantics():
+    scores = Scorer.score_links([], negative_labels=["NIL"])
+    assert scores["nel_score"] == 0.0
+    assert scores["nel_micro_f"] == 0.0
+    assert scores["nel_macro_f"] == 0.0
+    assert scores["nel_f_per_type"] == {}
+
+
+def test_scorer_state_empty_merges_as_real(rich_examples):
+    nlp, examples = rich_examples
+    scorer = Scorer(nlp=nlp)
+    real = scorer.score(examples)
+    empty_state = scorer.accumulate([])
+    states = [scorer.accumulate(examples[:3]), scorer.accumulate(examples[3:])]
+    merged = ScorerState.merge([empty_state] + states).finalize()
+    for key in real:
+        assert merged[key] == real[key], key
+
+
+def test_scorer_state_missing_annotation_shard(rich_examples):
+    nlp, examples = rich_examples
+    scorer = Scorer(nlp=nlp)
+    # copies of the first examples with reference NER marked missing
+    missing_examples = []
+    for eg in examples[:2]:
+        # remove the entities from the JSON so from_json produces a reference
+        # with missing NER annotation (not "O")
+        ref_json = eg.reference.to_json()
+        ref_json.pop("ents", None)
+        ref = Doc(nlp.vocab).from_json(ref_json)
+        missing_examples.append(Example(eg.predicted.copy(), ref))
+    # a single evaluation over the same data skips examples missing NER
+    mixed = missing_examples + examples[2:]
+    full = scorer.score(mixed)
+    states = [
+        scorer.accumulate(missing_examples),
+        scorer.accumulate(examples[2:]),
+    ]
+    # the shard with missing annotations does not score as 0, it stays null
+    assert states[0].finalize()["ents_p"] is None
+    merged = ScorerState.merge(states).finalize()
+    assert merged["ents_p"] == full["ents_p"]
+    assert merged["ents_r"] == full["ents_r"]
+    assert merged["ents_f"] == full["ents_f"]
+
+
+def test_scorer_state_disk_roundtrip(rich_examples):
+    nlp, examples = rich_examples
+    scorer = Scorer(nlp=nlp)
+    state = scorer.accumulate(examples[:2])
+    with make_tempdir() as tmpdir:
+        path = tmpdir / "state.json"
+        state.to_disk(path)
+        loaded = ScorerState.from_disk(path)
+        assert loaded.finalize() == state.finalize()
+        gz_path = tmpdir / "state.json.gz"
+        state.to_disk(gz_path)
+        loaded_gz = ScorerState.from_disk(gz_path)
+        assert loaded_gz.finalize() == state.finalize()
+
+
+def _nel_example(nlp, words, *, pred_ents, gold_ents):
+    pred = Doc(nlp.vocab, words=words, spaces=[True] * (len(words) - 1) + [False])
+    gold = Doc(nlp.vocab, words=words, spaces=[True] * (len(words) - 1) + [False])
+    for start, end, label, kb_id in gold_ents:
+        span = Span(gold, start, end, label=label)
+        span.kb_id_ = kb_id
+        gold.ents = list(gold.ents) + [span]
+    for start, end, label, kb_id in pred_ents:
+        span = Span(pred, start, end, label=label)
+        span.kb_id_ = kb_id
+        pred.ents = list(pred.ents) + [span]
+    return Example(pred, gold)
+
+
+def test_scorer_state_links_merge_tolerance():
+    nlp = English()
+    examples = [
+        _nel_example(
+            nlp,
+            ["a", "b"],
+            gold_ents=[(0, 1, "PERSON", "Q1")],
+            pred_ents=[(0, 1, "PERSON", "Q1")],
+        ),
+        _nel_example(
+            nlp,
+            ["c", "d"],
+            gold_ents=[(0, 1, "ORG", "Q2")],
+            pred_ents=[(0, 1, "ORG", "NIL")],
+        ),
+        _nel_example(
+            nlp,
+            ["e", "f"],
+            gold_ents=[(0, 1, "ORG", "Q3")],
+            pred_ents=[(0, 1, "ORG", "Q3")],
+        ),
+    ]
+    full = Scorer.score_links(examples, negative_labels=["NIL"])
+    states = [
+        ScorerState(
+            states={
+                "nel": Scorer.score_links(
+                    [eg], negative_labels=["NIL"], _state=True
+                )
+            },
+            pipeline=["nel"],
+        )
+        for eg in examples
+    ]
+    merged = ScorerState.merge(states).finalize()
+    assert merged["nel_micro_f"] == full["nel_micro_f"]
+    assert merged["nel_macro_p"] == approx(full["nel_macro_p"])
+    assert merged["nel_macro_r"] == approx(full["nel_macro_r"])
+    assert merged["nel_macro_f"] == approx(full["nel_macro_f"])
+    assert merged["nel_f_per_type"] == full["nel_f_per_type"]
 
 
 def test_score_cats(en_tokenizer):

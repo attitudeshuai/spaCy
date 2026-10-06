@@ -23,7 +23,7 @@ from ..errors import Errors, Warnings
 from ..language import Language
 from ..matcher import Matcher, PhraseMatcher
 from ..matcher.levenshtein import levenshtein_compare
-from ..scorer import Scorer
+from ..scorer import Scorer, scorer_with_state
 from ..tokens import Doc, Span
 from ..training import Example
 from ..util import SimpleFrozenList, ensure_path
@@ -93,6 +93,7 @@ def make_preserve_existing_ents_filter():
     return prioritize_existing_ents_filter
 
 
+@scorer_with_state
 def overlapping_labeled_spans_score(
     examples: Iterable[Example], *, spans_key=DEFAULT_SPANS_KEY, **kwargs
 ) -> Dict[str, Any]:

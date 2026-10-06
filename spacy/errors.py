@@ -988,6 +988,25 @@ class Errors(metaclass=ErrorsWithCodes):
     E1057 = ("The `TextCatReduce` architecture must be used with at least one "
              "reduction. Please enable one of `use_reduce_first`, "
              "`use_reduce_last`, `use_reduce_max` or `use_reduce_mean`.")
+    E1058 = ("Cannot merge evaluation states: state ID '{state_id}' occurs more "
+             "than once. The same evaluation state can only be merged once.")
+    E1059 = ("Cannot merge evaluation states: the pipeline of state '{state_id}' "
+             "({pipeline}) doesn't match the pipeline of state '{other_id}' "
+             "({other_pipeline}). Only states produced by the same pipeline can "
+             "be merged.")
+    E1060 = ("Cannot merge evaluation states for component '{name}': the scorer "
+             "configuration {cfg} of state '{state_id}' doesn't match the "
+             "scorer configuration {other_cfg} of state '{other_id}'. Only "
+             "states produced with the same scorer settings can be merged.")
+    E1061 = ("Cannot merge evaluation states for component '{name}': the "
+             "component state of '{state_id}' contains {n_parts} score part(s) "
+             "while the component state of '{other_id}' contains {n_other} "
+             "(part types {part_types} vs {other_types}).")
+    E1062 = ("The scorer used by component '{name}' doesn't support mergeable "
+             "evaluation states (it doesn't accept the '_state' keyword "
+             "argument). Custom scorers need to accept and handle the '_state' "
+             "keyword argument to be used with sharded evaluation.")
+    E1063 = ("Invalid evaluation state: {msg}")
 
 
 # Deprecated model shortcuts, only used in errors and warnings

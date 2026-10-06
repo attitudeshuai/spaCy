@@ -10,7 +10,7 @@ from thinc.types import Floats2d, Ints1d, Ints2d, Ragged
 from ..compat import Protocol, runtime_checkable
 from ..errors import Errors
 from ..language import Language
-from ..scorer import Scorer
+from ..scorer import Scorer, scorer_with_state
 from ..tokens import Doc, Span, SpanGroup
 from ..training import Example, validate_examples
 from ..vocab import Vocab
@@ -156,6 +156,7 @@ def build_preset_spans_suggester(spans_key: str) -> Suggester:
     return partial(preset_spans_suggester, spans_key=spans_key)
 
 
+@scorer_with_state
 def spancat_score(examples: Iterable[Example], **kwargs) -> Dict[str, Any]:
     kwargs = dict(kwargs)
     attr_prefix = "spans_"

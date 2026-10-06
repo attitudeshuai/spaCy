@@ -8,7 +8,7 @@ from .. import util
 from ..errors import Errors
 from ..language import Language
 from ..matcher import Matcher
-from ..scorer import Scorer
+from ..scorer import Scorer, scorer_with_state
 from ..symbols import IDS
 from ..tokens import Doc, Span
 from ..tokens._retokenize import normalize_token_attrs, set_token_attrs
@@ -25,10 +25,25 @@ TagMapType = Dict[str, Dict[Union[int, str], Union[int, str]]]
 MorphRulesType = Dict[str, Dict[str, Dict[Union[int, str], Union[int, str]]]]
 
 
-def attribute_ruler_score(examples: Iterable[Example], **kwargs) -> Dict[str, Any]:
+@scorer_with_state
+def attribute_ruler_score(
+    examples: Iterable[Example], **kwargs
+) -> Dict[str, Any]:
     def morph_key_getter(token, attr):
         return getattr(token, attr).key
 
+    if kwargs.get("_state"):
+        parts = []
+        parts += Scorer.score_token_attr(examples, "tag", **kwargs)["parts"]
+        parts += Scorer.score_token_attr(examples, "pos", **kwargs)["parts"]
+        parts += Scorer.score_token_attr(
+            examples, "morph", getter=morph_key_getter, **kwargs
+        )["parts"]
+        parts += Scorer.score_token_attr_per_feat(
+            examples, "morph", getter=morph_key_getter, **kwargs
+        )["parts"]
+        parts += Scorer.score_token_attr(examples, "lemma", **kwargs)["parts"]
+        return {"parts": parts}
     results = {}
     results.update(Scorer.score_token_attr(examples, "tag", **kwargs))
     results.update(Scorer.score_token_attr(examples, "pos", **kwargs))

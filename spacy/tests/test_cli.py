@@ -26,7 +26,7 @@ from spacy.cli.debug_data import (
     _print_span_characteristics,
 )
 from spacy.cli.download import get_compatibility, get_version
-from spacy.cli.evaluate import render_parses
+from spacy.cli.evaluate import evaluate, merge_eval_states_cli, render_parses
 from spacy.cli.find_threshold import find_threshold
 from spacy.cli.init_config import RECOMMENDATIONS, fill_config, init_config
 from spacy.cli.init_pipeline import _init_labels
@@ -1222,6 +1222,46 @@ def test_debug_data_trainable_lemmatizer_not_annotated():
 def test_project_api_imports():
     from spacy.cli import project_run
     from spacy.cli.project.run import project_run  # noqa: F401, F811
+
+
+def test_cli_evaluate_shards():
+    nlp = spacy.blank("en")
+    nlp.add_pipe("sentencizer")
+    docs = [
+        nlp("First sentence. Second one."),
+        nlp("Third doc text. Fourth indeed."),
+        nlp("Fifth short one. Sixth here."),
+    ]
+    with make_tempdir() as tmpdir:
+        model_dir = tmpdir / "model"
+        nlp.to_disk(model_dir)
+        data_path = tmpdir / "data.spacy"
+        DocBin(docs=docs).to_disk(data_path)
+        output_path = tmpdir / "scores.json"
+        full_data = evaluate(model_dir, data_path, output=output_path, silent=True)
+        state_dir = tmpdir / "states"
+        shard_data = evaluate(
+            model_dir,
+            data_path,
+            shards=3,
+            state_dir=state_dir,
+            silent=True,
+        )
+        state_files = sorted(state_dir.glob("shard-*.json"))
+        assert len(state_files) == 3
+        # the sharded evaluation matches the regular one apart from timing
+        for key in full_data:
+            if key == "speed":
+                continue
+            assert shard_data[key] == full_data[key], key
+        # aggregate the state files from disk and compare
+        merge_output = tmpdir / "merged.json"
+        merge_eval_states_cli(state_files, output=merge_output, spans_key="sc")
+        merged = srsly.read_json(merge_output)
+        for key in full_data:
+            if key == "speed":
+                continue
+            assert merged[key] == full_data[key], key
 
 
 def test_download_rejects_relative_urls(monkeypatch):

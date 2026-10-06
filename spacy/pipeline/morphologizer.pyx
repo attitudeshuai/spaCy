@@ -14,7 +14,7 @@ from .. import util
 from ..errors import Errors
 from ..language import Language
 from ..parts_of_speech import IDS as POS_IDS
-from ..scorer import Scorer
+from ..scorer import Scorer, scorer_with_state
 from ..training import validate_examples, validate_get_examples
 from ..util import registry
 from .tagger import Tagger
@@ -49,10 +49,21 @@ maxout_pieces = 3
 DEFAULT_MORPH_MODEL = Config().from_str(default_model_config)["model"]
 
 
+@scorer_with_state
 def morphologizer_score(examples, **kwargs):
     def morph_key_getter(token, attr):
         return getattr(token, attr).key
 
+    if kwargs.get("_state"):
+        parts = []
+        parts += Scorer.score_token_attr(examples, "pos", **kwargs)["parts"]
+        parts += Scorer.score_token_attr(
+            examples, "morph", getter=morph_key_getter, **kwargs
+        )["parts"]
+        parts += Scorer.score_token_attr_per_feat(
+            examples, "morph", getter=morph_key_getter, **kwargs
+        )["parts"]
+        return {"parts": parts}
     results = {}
     results.update(Scorer.score_token_attr(examples, "pos", **kwargs))
     results.update(Scorer.score_token_attr(examples, "morph", getter=morph_key_getter, **kwargs))

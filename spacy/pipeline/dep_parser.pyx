@@ -12,7 +12,7 @@ from ._parser_internals.arc_eager cimport ArcEager
 from .transition_parser cimport Parser
 
 from ..language import Language
-from ..scorer import Scorer
+from ..scorer import Scorer, scorer_with_state
 from ..training import remove_bilu_prefix
 from ..util import registry
 from ._parser_internals import nonproj
@@ -41,6 +41,7 @@ subword_features = true
 DEFAULT_PARSER_MODEL = Config().from_str(default_model_config)["model"]
 
 
+@scorer_with_state
 def parser_score(examples, **kwargs):
     """Score a batch of examples.
 
@@ -57,6 +58,16 @@ def parser_score(examples, **kwargs):
         dep = getattr(token, attr)
         dep = token.vocab.strings.as_string(dep).lower()
         return dep
+    if kwargs.get("_state"):
+        sents_state = Scorer.score_spans(
+            examples, "sents", has_annotation=has_sents, **kwargs
+        )
+        sents_state["parts"][0]["scores"].pop("sents_per_type", None)
+        deps_kwargs = dict(kwargs)
+        deps_kwargs.setdefault("getter", dep_getter)
+        deps_kwargs.setdefault("ignore_labels", ("p", "punct"))
+        deps_state = Scorer.score_deps(examples, "dep", **deps_kwargs)
+        return {"parts": sents_state["parts"] + deps_state["parts"]}
     results = {}
     results.update(Scorer.score_spans(examples, "sents", has_annotation=has_sents, **kwargs))
     kwargs.setdefault("getter", dep_getter)

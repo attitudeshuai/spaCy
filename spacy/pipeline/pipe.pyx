@@ -89,6 +89,33 @@ cdef class Pipe:
             return self.scorer(examples, **scorer_kwargs)
         return {}
 
+    def score_state(self, examples: Iterable[Example], **kwargs) -> Dict[str, Any]:
+        """Accumulate the mergeable evaluation state for a batch of examples.
+
+        examples (Iterable[Example]): The examples to score.
+        RETURNS (Dict[str, Any]): The component state, keyed by "parts".
+        """
+        if hasattr(self, "scorer") and self.scorer is not None:
+            scorer_kwargs = {}
+            # use default settings from cfg (e.g., threshold)
+            if hasattr(self, "cfg") and isinstance(self.cfg, dict):
+                scorer_kwargs.update(self.cfg)
+            # override self.cfg["labels"] with self.labels
+            if hasattr(self, "labels"):
+                scorer_kwargs["labels"] = self.labels
+            # override with kwargs settings
+            scorer_kwargs.update(kwargs)
+            scorer_kwargs["_state"] = True
+            try:
+                return self.scorer(examples, **scorer_kwargs)
+            except TypeError as e:
+                if "_state" in str(e):
+                    raise ValueError(
+                        Errors.E1062.format(name=getattr(self, "name", "?"))
+                    ) from e
+                raise
+        return {"parts": []}
+
     @property
     def is_trainable(self) -> bool:
         return False

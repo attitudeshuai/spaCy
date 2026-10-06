@@ -6,7 +6,7 @@ from thinc.types import Floats2d
 
 from ..errors import Errors
 from ..language import Language
-from ..scorer import Scorer
+from ..scorer import Scorer, scorer_with_state
 from ..tokens import Doc, Span
 from ..training import Example
 from .spancat import DEFAULT_SPANS_KEY
@@ -45,6 +45,7 @@ def make_span_finder_scorer():
     return span_finder_score
 
 
+@scorer_with_state
 def span_finder_score(examples: Iterable[Example], **kwargs) -> Dict[str, Any]:
     kwargs = dict(kwargs)
     attr_prefix = "spans_"
@@ -56,6 +57,9 @@ def span_finder_score(examples: Iterable[Example], **kwargs) -> Dict[str, Any]:
     kwargs.setdefault("has_annotation", lambda doc: key in doc.spans)
     kwargs.setdefault("allow_overlap", True)
     kwargs.setdefault("labeled", False)
+    if kwargs.get("_state"):
+        # labeled=False already means there is no per_type part
+        return Scorer.score_spans(examples, **kwargs)
     scores = Scorer.score_spans(examples, **kwargs)
     scores.pop(f"{kwargs['attr']}_per_type", None)
     return scores

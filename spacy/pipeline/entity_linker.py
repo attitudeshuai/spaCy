@@ -12,7 +12,7 @@ from .. import util
 from ..errors import Errors
 from ..kb import Candidate, KnowledgeBase
 from ..language import Language
-from ..scorer import Scorer
+from ..scorer import Scorer, scorer_with_state
 from ..tokens import Doc, Span
 from ..training import Example, validate_examples, validate_get_examples
 from ..util import SimpleFrozenList
@@ -40,6 +40,7 @@ subword_features = true
 DEFAULT_NEL_MODEL = Config().from_str(default_model_config)["model"]
 
 
+@scorer_with_state
 def entity_linker_score(examples, **kwargs):
     return Scorer.score_links(examples, negative_labels=[EntityLinker.NIL], **kwargs)
 

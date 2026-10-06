@@ -81,6 +81,10 @@ class KoreanTokenizer(DummyTokenizer):
         validate_examples(examples, "KoreanTokenizer.score")
         return Scorer.score_tokenization(examples)
 
+    def score_state(self, examples, **kwargs):
+        validate_examples(examples, "KoreanTokenizer.score_state")
+        return Scorer.score_tokenization(examples, _state=True)
+
 
 class KoreanDefaults(BaseDefaults):
     config = load_config_from_str(DEFAULT_CONFIG)

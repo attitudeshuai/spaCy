@@ -16,7 +16,7 @@ from ...errors import Errors, Warnings
 from ...kb import Candidate, KnowledgeBase
 from ...language import Language
 from ...ml import empty_kb
-from ...scorer import Scorer
+from ...scorer import Scorer, scorer_with_state
 from ...tokens import Doc, Span
 from ...training import Example, validate_examples, validate_get_examples
 from ...util import SimpleFrozenList
@@ -28,6 +28,7 @@ from ..trainable_pipe import TrainablePipe
 BACKWARD_OVERWRITE = True
 
 
+@scorer_with_state
 def entity_linker_score(examples, **kwargs):
     return Scorer.score_links(examples, negative_labels=[EntityLinker_v1.NIL], **kwargs)
 

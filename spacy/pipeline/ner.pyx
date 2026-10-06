@@ -12,7 +12,7 @@ from ._parser_internals.ner cimport BiluoPushDown
 from .transition_parser cimport Parser
 
 from ..language import Language
-from ..scorer import get_ner_prf
+from ..scorer import get_ner_prf, scorer_with_state
 from ..training import remove_bilu_prefix
 from ..util import registry
 
@@ -38,6 +38,7 @@ subword_features = true
 DEFAULT_NER_MODEL = Config().from_str(default_model_config)["model"]
 
 
+@scorer_with_state
 def ner_score(examples, **kwargs):
     return get_ner_prf(examples, **kwargs)
 

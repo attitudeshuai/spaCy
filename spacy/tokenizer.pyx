@@ -756,7 +756,11 @@ cdef class Tokenizer:
 
     def score(self, examples, **kwargs):
         validate_examples(examples, "Tokenizer.score")
-        return Scorer.score_tokenization(examples)
+        return Scorer.score_tokenization(examples, **kwargs)
+
+    def score_state(self, examples, **kwargs):
+        validate_examples(examples, "Tokenizer.score_state")
+        return Scorer.score_tokenization(examples, _state=True, **kwargs)
 
     def to_disk(self, path, **kwargs):
         """Save the current state to a directory.

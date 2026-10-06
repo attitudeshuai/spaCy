@@ -9,7 +9,7 @@ from .. import util
 from ..errors import Errors, Warnings
 from ..language import Language
 from ..lookups import Lookups, load_lookups
-from ..scorer import Scorer
+from ..scorer import Scorer, scorer_with_state
 from ..tokens import Doc, Token
 from ..training import Example
 from ..util import SimpleFrozenList, logger
@@ -17,6 +17,7 @@ from ..vocab import Vocab
 from .pipe import Pipe
 
 
+@scorer_with_state
 def lemmatizer_score(examples: Iterable[Example], **kwargs) -> Dict[str, Any]:
     return Scorer.score_token_attr(examples, "lemma", **kwargs)
 

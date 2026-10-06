@@ -1,3 +1,4 @@
+import uuid
 from collections import defaultdict
 from typing import (
     TYPE_CHECKING,
@@ -17,7 +18,7 @@ from .errors import Errors
 from .morphology import Morphology
 from .tokens import Doc, Span, Token
 from .training import Example
-from .util import SimpleFrozenList, get_lang_class
+from .util import SimpleFrozenList, ensure_path, get_lang_class
 
 if TYPE_CHECKING:
     # This lets us add type hints for mypy etc. without causing circular imports
@@ -26,6 +27,8 @@ if TYPE_CHECKING:
 
 DEFAULT_PIPELINE = ("senter", "tagger", "morphologizer", "parser", "ner", "textcat")
 MISSING_VALUES = frozenset([None, 0, ""])
+
+STATE_VERSION = 1
 
 
 class PRFScore:
@@ -108,6 +111,354 @@ class ROCAUCScore:
         return self.saved_score
 
 
+# ###########################################################################
+# State helpers: the mergeable intermediate state is built from minimum-size
+# integer counts (tp/fp/fn) and, for ROC AUC scores which cannot be recovered
+# from counts, the per-example (gold, cand) point pairs.
+# ###########################################################################
+
+
+def _prf_counts(prf: PRFScore) -> List[int]:
+    return [int(prf.tp), int(prf.fp), int(prf.fn)]
+
+
+def _prf_from_counts(counts: List[int]) -> PRFScore:
+    return PRFScore(tp=int(counts[0]), fp=int(counts[1]), fn=int(counts[2]))
+
+
+def _add_counts(counts1: List[int], counts2: List[int]) -> List[int]:
+    return [a + b for a, b in zip(counts1, counts2)]
+
+
+def _merge_per_type_counts(d1: Dict, d2: Dict) -> Dict:
+    result = {k: list(v) for k, v in d1.items()}
+    for k, counts in d2.items():
+        if k in result:
+            result[k] = _add_counts(result[k], counts)
+        else:
+            result[k] = list(counts)
+    return result
+
+
+def _auc_points(auc: ROCAUCScore) -> List[List[float]]:
+    return [[float(gold), float(cand)] for gold, cand in zip(auc.golds, auc.cands)]
+
+
+def _auc_from_points(points: Iterable[Iterable[float]]) -> ROCAUCScore:
+    auc = ROCAUCScore()
+    for gold, cand in points:
+        auc.score_set(cand, gold)
+    return auc
+
+
+def _merge_auc_per_type(d1: Dict, d2: Dict) -> Dict:
+    result = {k: {"points": list(v["points"])} for k, v in d1.items()}
+    for k, value in d2.items():
+        if k in result:
+            result[k]["points"] = result[k]["points"] + list(value["points"])
+        else:
+            result[k] = {"points": list(value["points"])}
+    return result
+
+
+def _make_part(part_type: str, cfg: Dict[str, Any], scores: Dict[str, Any]):
+    return {"type": part_type, "cfg": cfg, "scores": scores}
+
+
+def scorer_with_state(fn):
+    """Mark a scorer callable as supporting the keyword-only '_state' argument,
+    i.e. it returns a component state dict instead of final scores."""
+    fn.supports_scorer_state = True  # type: ignore[attr-defined]
+    return fn
+
+
+def _scorer_supports_state(component) -> bool:
+    scorer = getattr(component, "scorer", None)
+    return bool(getattr(scorer, "supports_scorer_state", False))
+
+
+def _finalize_component_state(component_state: Dict[str, Any]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    for part in component_state["parts"]:
+        result.update(FINALIZERS[part["type"]](part))
+    return result
+
+
+def _sorted_values(values: Iterable[Any]) -> List[Any]:
+    """Sort a set of potentially mixed-type config values deterministically."""
+    return sorted(values, key=repr)
+
+
+def _merge_part_scores(part_type: str, s1: Dict, s2: Dict) -> Dict:
+    if part_type == "tokenization":
+        return {
+            "acc": _add_counts(s1["acc"], s2["acc"]),
+            "prf": _add_counts(s1["prf"], s2["prf"]),
+        }
+    if part_type == "token_attr":
+        return {"score": _add_counts(s1["score"], s2["score"])}
+    if part_type == "token_per_feat":
+        return {
+            "micro": _add_counts(s1["micro"], s2["micro"]),
+            "per_feat": _merge_per_type_counts(s1["per_feat"], s2["per_feat"]),
+        }
+    if part_type == "spans":
+        result = {"score": _add_counts(s1["score"], s2["score"])}
+        if "per_type" in s1 and "per_type" in s2:
+            result["per_type"] = _merge_per_type_counts(
+                s1["per_type"], s2["per_type"]
+            )
+        return result
+    if part_type == "cats":
+        return {
+            "micro": _add_counts(s1["micro"], s2["micro"]),
+            "f_per_type": _merge_per_type_counts(s1["f_per_type"], s2["f_per_type"]),
+            "auc_per_type": _merge_auc_per_type(
+                s1["auc_per_type"], s2["auc_per_type"]
+            ),
+        }
+    if part_type == "links":
+        return {
+            "micro": _add_counts(s1["micro"], s2["micro"]),
+            "f_per_type": _merge_per_type_counts(s1["f_per_type"], s2["f_per_type"]),
+        }
+    if part_type == "deps":
+        return {
+            "unlabelled": _add_counts(s1["unlabelled"], s2["unlabelled"]),
+            "labelled": _add_counts(s1["labelled"], s2["labelled"]),
+            "per_dep": _merge_per_type_counts(s1["per_dep"], s2["per_dep"]),
+        }
+    if part_type == "ner":
+        return {
+            "score": _add_counts(s1["score"], s2["score"]),
+            "per_type": _merge_per_type_counts(s1["per_type"], s2["per_type"]),
+        }
+    raise ValueError(Errors.E1063.format(msg=f"unknown part type '{part_type}'"))
+
+
+# ###########################################################################
+# Part finalizers: restore the score objects from a part and produce the same
+# final score dictionaries as the original scoring methods. `canonical=True`
+# (i.e. the part results from a merge) uses sorted key orders so that merged
+# results are independent of the merge order. Non-canonical parts keep the
+# original insertion order, so scores without sharding are bit-identical.
+# ###########################################################################
+
+
+def _sorted_per_type(per_type: Dict[str, PRFScore]) -> Dict[str, Dict[str, float]]:
+    return {k: per_type[k].to_dict() for k in sorted(per_type)}
+
+
+def _finalize_tokenization(part, *, canonical: bool = False):
+    acc = _prf_from_counts(part["scores"]["acc"])
+    if len(acc) == 0:
+        return {
+            "token_acc": None,
+            "token_p": None,
+            "token_r": None,
+            "token_f": None,
+        }
+    prf = _prf_from_counts(part["scores"]["prf"])
+    return {
+        "token_acc": acc.precision,
+        "token_p": prf.precision,
+        "token_r": prf.recall,
+        "token_f": prf.fscore,
+    }
+
+
+def _finalize_token_attr(part, *, canonical: bool = False):
+    attr = part["cfg"]["attr"]
+    prf = _prf_from_counts(part["scores"]["score"])
+    if len(prf) == 0:
+        return {f"{attr}_acc": None}
+    return {f"{attr}_acc": prf.fscore}
+
+
+def _finalize_token_per_feat(part, *, canonical: bool = False):
+    attr = part["cfg"]["attr"]
+    micro = _prf_from_counts(part["scores"]["micro"])
+    result: Dict[str, Any] = {}
+    if len(micro) == 0:
+        result[f"{attr}_micro_p"] = None
+        result[f"{attr}_micro_r"] = None
+        result[f"{attr}_micro_f"] = None
+        result[f"{attr}_per_feat"] = None
+        return result
+    result[f"{attr}_micro_p"] = micro.precision
+    result[f"{attr}_micro_r"] = micro.recall
+    result[f"{attr}_micro_f"] = micro.fscore
+    per_feat = {k: _prf_from_counts(c) for k, c in part["scores"]["per_feat"].items()}
+    if canonical:
+        result[f"{attr}_per_feat"] = _sorted_per_type(per_feat)
+    else:
+        result[f"{attr}_per_feat"] = {k: v.to_dict() for k, v in per_feat.items()}
+    return result
+
+
+def _finalize_spans(part, *, canonical: bool = False):
+    attr = part["cfg"]["attr"]
+    labeled = part["cfg"]["labeled"]
+    final_scores: Dict[str, Any] = {
+        f"{attr}_p": None,
+        f"{attr}_r": None,
+        f"{attr}_f": None,
+    }
+    if labeled:
+        final_scores[f"{attr}_per_type"] = None
+    score = _prf_from_counts(part["scores"]["score"])
+    if len(score) > 0:
+        final_scores[f"{attr}_p"] = score.precision
+        final_scores[f"{attr}_r"] = score.recall
+        final_scores[f"{attr}_f"] = score.fscore
+        if labeled:
+            per_type = {
+                k: _prf_from_counts(c) for k, c in part["scores"]["per_type"].items()
+            }
+            if canonical:
+                final_scores[f"{attr}_per_type"] = _sorted_per_type(per_type)
+            else:
+                final_scores[f"{attr}_per_type"] = {
+                    k: v.to_dict() for k, v in per_type.items()
+                }
+    return final_scores
+
+
+def _finalize_cats(part, *, canonical: bool = False):
+    cfg = part["cfg"]
+    attr = cfg["attr"]
+    multi_label = cfg["multi_label"]
+    positive_label = cfg["positive_label"]
+    f_per_type = {
+        k: _prf_from_counts(c) for k, c in part["scores"]["f_per_type"].items()
+    }
+    micro_prf = _prf_from_counts(part["scores"]["micro"])
+    auc_per_type = {
+        k: _auc_from_points(v["points"])
+        for k, v in part["scores"]["auc_per_type"].items()
+    }
+    n_cats = len(f_per_type) + 1e-100
+    macro_p = sum(prf.precision for prf in f_per_type.values()) / n_cats
+    macro_r = sum(prf.recall for prf in f_per_type.values()) / n_cats
+    macro_f = sum(prf.fscore for prf in f_per_type.values()) / n_cats
+    # Limit macro_auc to those labels with gold annotations,
+    # but still divide by all cats to avoid artificial boosting of datasets with missing labels
+    macro_auc = (
+        sum(auc.score if auc.is_binary() else 0.0 for auc in auc_per_type.values())
+        / n_cats
+    )
+    results: Dict[str, Any] = {
+        f"{attr}_score": None,
+        f"{attr}_score_desc": None,
+        f"{attr}_micro_p": micro_prf.precision,
+        f"{attr}_micro_r": micro_prf.recall,
+        f"{attr}_micro_f": micro_prf.fscore,
+        f"{attr}_macro_p": macro_p,
+        f"{attr}_macro_r": macro_r,
+        f"{attr}_macro_f": macro_f,
+        f"{attr}_macro_auc": macro_auc,
+        f"{attr}_f_per_type": {k: v.to_dict() for k, v in f_per_type.items()},
+        f"{attr}_auc_per_type": {
+            k: v.score if v.is_binary() else None for k, v in auc_per_type.items()
+        },
+    }
+    if len(cfg["labels"]) == 2 and not multi_label and positive_label:
+        positive_label_f = f_per_type[positive_label].fscore
+        results[f"{attr}_score"] = positive_label_f
+        results[f"{attr}_score_desc"] = f"F ({positive_label})"
+    elif not multi_label:
+        results[f"{attr}_score"] = results[f"{attr}_macro_f"]
+        results[f"{attr}_score_desc"] = "macro F"
+    else:
+        results[f"{attr}_score"] = results[f"{attr}_macro_auc"]
+        results[f"{attr}_score_desc"] = "macro AUC"
+    return results
+
+
+def _finalize_links(part, *, canonical: bool = False):
+    f_per_type = {
+        k: _prf_from_counts(c) for k, c in part["scores"]["f_per_type"].items()
+    }
+    micro_prf = _prf_from_counts(part["scores"]["micro"])
+    label_order = sorted(f_per_type) if canonical else list(f_per_type)
+    n_labels = len(f_per_type) + 1e-100
+    macro_p = sum(f_per_type[k].precision for k in label_order) / n_labels
+    macro_r = sum(f_per_type[k].recall for k in label_order) / n_labels
+    macro_f = sum(f_per_type[k].fscore for k in label_order) / n_labels
+    if canonical:
+        per_type = _sorted_per_type(f_per_type)
+    else:
+        per_type = {k: v.to_dict() for k, v in f_per_type.items()}
+    results = {
+        "nel_score": micro_prf.fscore,
+        "nel_score_desc": "micro F",
+        "nel_micro_p": micro_prf.precision,
+        "nel_micro_r": micro_prf.recall,
+        "nel_micro_f": micro_prf.fscore,
+        "nel_macro_p": macro_p,
+        "nel_macro_r": macro_r,
+        "nel_macro_f": macro_f,
+        "nel_f_per_type": per_type,
+    }
+    return results
+
+
+def _finalize_deps(part, *, canonical: bool = False):
+    attr = part["cfg"]["attr"]
+    unlabelled = _prf_from_counts(part["scores"]["unlabelled"])
+    if len(unlabelled) == 0:
+        return {
+            f"{attr}_uas": None,
+            f"{attr}_las": None,
+            f"{attr}_las_per_type": None,
+        }
+    labelled = _prf_from_counts(part["scores"]["labelled"])
+    per_dep = {k: _prf_from_counts(c) for k, c in part["scores"]["per_dep"].items()}
+    if canonical:
+        per_type = _sorted_per_type(per_dep)
+    else:
+        per_type = {k: v.to_dict() for k, v in per_dep.items()}
+    return {
+        f"{attr}_uas": unlabelled.fscore,
+        f"{attr}_las": labelled.fscore,
+        f"{attr}_las_per_type": per_type,
+    }
+
+
+def _finalize_ner(part, *, canonical: bool = False):
+    score = _prf_from_counts(part["scores"]["score"])
+    if len(score) == 0:
+        return {
+            "ents_p": None,
+            "ents_r": None,
+            "ents_f": None,
+            "ents_per_type": None,
+        }
+    per_type = {k: _prf_from_counts(c) for k, c in part["scores"]["per_type"].items()}
+    if canonical:
+        per_type_dict = _sorted_per_type(per_type)
+    else:
+        per_type_dict = {k: v.to_dict() for k, v in per_type.items()}
+    return {
+        "ents_p": score.precision,
+        "ents_r": score.recall,
+        "ents_f": score.fscore,
+        "ents_per_type": per_type_dict,
+    }
+
+
+FINALIZERS = {
+    "tokenization": _finalize_tokenization,
+    "token_attr": _finalize_token_attr,
+    "token_per_feat": _finalize_token_per_feat,
+    "spans": _finalize_spans,
+    "cats": _finalize_cats,
+    "links": _finalize_links,
+    "deps": _finalize_deps,
+    "ner": _finalize_ner,
+}
+
+
 class Scorer:
     """Compute evaluation scores."""
 
@@ -143,32 +494,75 @@ class Scorer:
 
         DOCS: https://spacy.io/api/scorer#score
         """
-        scores = {}
-        if hasattr(self.nlp.tokenizer, "score"):
-            if per_component:
-                scores["tokenizer"] = self.nlp.tokenizer.score(examples, **self.cfg)
+        scores: Dict[str, Any] = {}
+        tokenizer = self.nlp.tokenizer
+        if hasattr(tokenizer, "score"):
+            if hasattr(tokenizer, "score_state"):
+                token_scores = _finalize_component_state(
+                    tokenizer.score_state(examples, **self.cfg)
+                )
             else:
-                scores.update(self.nlp.tokenizer.score(examples, **self.cfg))  # type: ignore
+                token_scores = tokenizer.score(examples, **self.cfg)
+            if per_component:
+                scores["tokenizer"] = token_scores
+            else:
+                scores.update(token_scores)
         for name, component in self.nlp.pipeline:
             if hasattr(component, "score"):
-                if per_component:
-                    scores[name] = component.score(examples, **self.cfg)
+                # built-in scorers traverse the same state pathway used for
+                # sharded evaluation; custom scorers without '_state' support
+                # are called directly, so results stay identical to before
+                if _scorer_supports_state(component):
+                    component_scores = _finalize_component_state(
+                        component.score_state(examples, **self.cfg)
+                    )
                 else:
-                    scores.update(component.score(examples, **self.cfg))
+                    component_scores = component.score(examples, **self.cfg)
+                if per_component:
+                    scores[name] = component_scores
+                else:
+                    scores.update(component_scores)
         return scores
 
+    def accumulate(self, examples: Iterable[Example]) -> "ScorerState":
+        """Evaluate a list of Examples and return the mergeable intermediate
+        evaluation state instead of the final scores.
+
+        examples (Iterable[Example]): The predicted annotations + correct annotations.
+        RETURNS (ScorerState): The evaluation state, which can be saved to disk,
+            transmitted and merged with states for other subsets.
+        """
+        states: Dict[str, Any] = {}
+        if hasattr(self.nlp.tokenizer, "score"):
+            states["tokenizer"] = self.nlp.tokenizer.score_state(examples, **self.cfg)
+        for name, component in self.nlp.pipeline:
+            if hasattr(component, "score"):
+                states[name] = component.score_state(examples, **self.cfg)
+        return ScorerState(
+            states=states, pipeline=list(self.nlp.pipe_names), cfg=self.cfg
+        )
+
     @staticmethod
-    def score_tokenization(examples: Iterable[Example], **cfg) -> Dict[str, Any]:
+    def score_tokenization(
+        examples: Iterable[Example], *, _state: bool = False, **cfg
+    ) -> Dict[str, Any]:
         """Returns accuracy and PRF scores for tokenization.
         * token_acc: # correct tokens / # gold tokens
         * token_p/r/f: PRF for token character spans
 
         examples (Iterable[Example]): Examples to score
         RETURNS (Dict[str, Any]): A dictionary containing the scores
-            token_acc/p/r/f.
+        token_acc/p/r/f.
 
         DOCS: https://spacy.io/api/scorer#score_tokenization
         """
+        part = Scorer._tokenization_part(examples)
+        if _state:
+            return {"parts": [part]}
+        return _finalize_tokenization(part)
+
+    @staticmethod
+    def _tokenization_part(examples: Iterable[Example]):
         acc_score = PRFScore()
         prf_score = PRFScore()
         for example in examples:
@@ -192,20 +586,11 @@ class Scorer:
                 else:
                     acc_score.tp += 1
             prf_score.score_set(pred_spans, gold_spans)
-        if len(acc_score) > 0:
-            return {
-                "token_acc": acc_score.precision,
-                "token_p": prf_score.precision,
-                "token_r": prf_score.recall,
-                "token_f": prf_score.fscore,
-            }
-        else:
-            return {
-                "token_acc": None,
-                "token_p": None,
-                "token_r": None,
-                "token_f": None,
-            }
+        return _make_part(
+            "tokenization",
+            {},
+            {"acc": _prf_counts(acc_score), "prf": _prf_counts(prf_score)},
+        )
 
     @staticmethod
     def score_token_attr(
@@ -214,6 +599,7 @@ class Scorer:
         *,
         getter: Callable[[Token, str], Any] = getattr,
         missing_values: Set[Any] = MISSING_VALUES,  # type: ignore[assignment]
+        _state: bool = False,
         **cfg,
     ) -> Dict[str, Any]:
         """Returns an accuracy score for a token-level attribute.
@@ -226,10 +612,17 @@ class Scorer:
         missing_values (Set[Any]): Attribute values to treat as missing annotation
             in the reference annotation.
         RETURNS (Dict[str, Any]): A dictionary containing the accuracy score
-            under the key attr_acc.
+        under the key attr_acc.
 
         DOCS: https://spacy.io/api/scorer#score_token_attr
         """
+        part = Scorer._token_attr_part(examples, attr, getter, missing_values)
+        if _state:
+            return {"parts": [part]}
+        return _finalize_token_attr(part)
+
+    @staticmethod
+    def _token_attr_part(examples, attr, getter, missing_values) -> Dict[str, Any]:
         tag_score = PRFScore()
         for example in examples:
             gold_doc = example.reference
@@ -252,11 +645,11 @@ class Scorer:
                     if gold_i not in missing_indices:
                         pred_tags.add((gold_i, getter(token, attr)))
             tag_score.score_set(pred_tags, gold_tags)
-        score_key = f"{attr}_acc"
-        if len(tag_score) == 0:
-            return {score_key: None}
-        else:
-            return {score_key: tag_score.fscore}
+        part_cfg = {
+            "attr": attr,
+            "missing_values": _sorted_values(missing_values),
+        }
+        return _make_part("token_attr", part_cfg, {"score": _prf_counts(tag_score)})
 
     @staticmethod
     def score_token_attr_per_feat(
@@ -265,6 +658,7 @@ class Scorer:
         *,
         getter: Callable[[Token, str], Any] = getattr,
         missing_values: Set[Any] = MISSING_VALUES,  # type: ignore[assignment]
+        _state: bool = False,
         **cfg,
     ) -> Dict[str, Any]:
         """Return micro PRF and PRF scores per feat for a token attribute in
@@ -278,9 +672,20 @@ class Scorer:
         missing_values (Set[Any]): Attribute values to treat as missing
             annotation in the reference annotation.
         RETURNS (dict): A dictionary containing the micro PRF scores under the
-            key attr_micro_p/r/f and the per-feat PRF scores under
-            attr_per_feat.
+        key attr_micro_p/r/f and the per-feat PRF scores under
+        attr_per_feat.
         """
+        part = Scorer._token_attr_per_feat_part(
+            examples, attr, getter, missing_values
+        )
+        if _state:
+            return {"parts": [part]}
+        return _finalize_token_per_feat(part)
+
+    @staticmethod
+    def _token_attr_per_feat_part(
+        examples, attr, getter, missing_values
+    ) -> Dict[str, Any]:
         micro_score = PRFScore()
         per_feat = {}
         for example in examples:
@@ -329,18 +734,18 @@ class Scorer:
                 per_feat[field].score_set(
                     pred_per_feat.get(field, set()), gold_per_feat.get(field, set())
                 )
-        result: Dict[str, Any] = {}
-        if len(micro_score) > 0:
-            result[f"{attr}_micro_p"] = micro_score.precision
-            result[f"{attr}_micro_r"] = micro_score.recall
-            result[f"{attr}_micro_f"] = micro_score.fscore
-            result[f"{attr}_per_feat"] = {k: v.to_dict() for k, v in per_feat.items()}
-        else:
-            result[f"{attr}_micro_p"] = None
-            result[f"{attr}_micro_r"] = None
-            result[f"{attr}_micro_f"] = None
-            result[f"{attr}_per_feat"] = None
-        return result
+        part_cfg = {
+            "attr": attr,
+            "missing_values": _sorted_values(missing_values),
+        }
+        return _make_part(
+            "token_per_feat",
+            part_cfg,
+            {
+                "micro": _prf_counts(micro_score),
+                "per_feat": {k: _prf_counts(v) for k, v in per_feat.items()},
+            },
+        )
 
     @staticmethod
     def score_spans(
@@ -351,6 +756,7 @@ class Scorer:
         has_annotation: Optional[Callable[[Doc], bool]] = None,
         labeled: bool = True,
         allow_overlap: bool = False,
+        _state: bool = False,
         **cfg,
     ) -> Dict[str, Any]:
         """Returns PRF scores for labeled spans.
@@ -373,6 +779,17 @@ class Scorer:
 
         DOCS: https://spacy.io/api/scorer#score_spans
         """
+        part = Scorer._spans_part(
+            examples, attr, getter, has_annotation, labeled, allow_overlap
+        )
+        if _state:
+            return {"parts": [part]}
+        return _finalize_spans(part)
+
+    @staticmethod
+    def _spans_part(
+        examples, attr, getter, has_annotation, labeled, allow_overlap
+    ) -> Dict[str, Any]:
         score = PRFScore()
         score_per_type = dict()
         for example in examples:
@@ -425,23 +842,17 @@ class Scorer:
                         v.score_set(pred_per_type[k], gold_per_type[k])
             # Score for all labels
             score.score_set(pred_spans, gold_spans)
-        # Assemble final result
-        final_scores: Dict[str, Any] = {
-            f"{attr}_p": None,
-            f"{attr}_r": None,
-            f"{attr}_f": None,
+        part_cfg = {
+            "attr": attr,
+            "labeled": labeled,
+            "allow_overlap": allow_overlap,
         }
+        part_scores: Dict[str, Any] = {"score": _prf_counts(score)}
         if labeled:
-            final_scores[f"{attr}_per_type"] = None
-        if len(score) > 0:
-            final_scores[f"{attr}_p"] = score.precision
-            final_scores[f"{attr}_r"] = score.recall
-            final_scores[f"{attr}_f"] = score.fscore
-            if labeled:
-                final_scores[f"{attr}_per_type"] = {
-                    k: v.to_dict() for k, v in score_per_type.items()
-                }
-        return final_scores
+            part_scores["per_type"] = {
+                k: _prf_counts(v) for k, v in score_per_type.items()
+            }
+        return _make_part("spans", part_cfg, part_scores)
 
     @staticmethod
     def score_cats(
@@ -453,11 +864,12 @@ class Scorer:
         multi_label: bool = True,
         positive_label: Optional[str] = None,
         threshold: Optional[float] = None,
+        _state: bool = False,
         **cfg,
     ) -> Dict[str, Any]:
         """Returns PRF and ROC AUC scores for a doc-level attribute with a
         dict with scores for each label like Doc.cats. The reported overall
-        score depends on the scorer settings.
+        score depends on scorer settings.
 
         examples (Iterable[Example]): Examples to score
         attr (str): The attribute to score.
@@ -489,21 +901,45 @@ class Scorer:
 
         DOCS: https://spacy.io/api/scorer#score_cats
         """
+        part = Scorer._cats_part(
+            examples,
+            attr,
+            getter,
+            labels,
+            multi_label,
+            positive_label,
+            threshold,
+        )
+        if _state:
+            return {"parts": [part]}
+        return _finalize_cats(part)
+
+    @staticmethod
+    def _cats_part(
+        examples,
+        attr,
+        getter,
+        labels,
+        multi_label,
+        positive_label,
+        threshold,
+    ) -> Dict[str, Any]:
+        labels_list = list(labels)
         if threshold is None:
             threshold = 0.5 if multi_label else 0.0
         if not multi_label:
             threshold = 0.0
-        f_per_type = {label: PRFScore() for label in labels}
-        auc_per_type = {label: ROCAUCScore() for label in labels}
-        labels = set(labels)
+        f_per_type = {label: PRFScore() for label in labels_list}
+        auc_per_type = {label: ROCAUCScore() for label in labels_list}
+        labels_set = set(labels_list)
         for example in examples:
             # Through this loop, None in the gold_cats indicates missing label.
             pred_cats = getter(example.predicted, attr)
-            pred_cats = {k: v for k, v in pred_cats.items() if k in labels}
+            pred_cats = {k: v for k, v in pred_cats.items() if k in labels_set}
             gold_cats = getter(example.reference, attr)
-            gold_cats = {k: v for k, v in gold_cats.items() if k in labels}
+            gold_cats = {k: v for k, v in gold_cats.items() if k in labels_set}
 
-            for label in labels:
+            for label in labels_set:
                 pred_score = pred_cats.get(label, 0.0)
                 gold_score = gold_cats.get(label)
                 if not gold_score and not multi_label:
@@ -511,7 +947,7 @@ class Scorer:
                 if gold_score is not None:
                     auc_per_type[label].score_set(pred_score, gold_score)
             if multi_label:
-                for label in labels:
+                for label in labels_set:
                     pred_score = pred_cats.get(label, 0.0)
                     gold_score = gold_cats.get(label)
                     if gold_score is not None:
@@ -542,46 +978,27 @@ class Scorer:
             micro_prf.tp += label_prf.tp
             micro_prf.fn += label_prf.fn
             micro_prf.fp += label_prf.fp
-        n_cats = len(f_per_type) + 1e-100
-        macro_p = sum(prf.precision for prf in f_per_type.values()) / n_cats
-        macro_r = sum(prf.recall for prf in f_per_type.values()) / n_cats
-        macro_f = sum(prf.fscore for prf in f_per_type.values()) / n_cats
-        # Limit macro_auc to those labels with gold annotations,
-        # but still divide by all cats to avoid artificial boosting of datasets with missing labels
-        macro_auc = (
-            sum(auc.score if auc.is_binary() else 0.0 for auc in auc_per_type.values())
-            / n_cats
-        )
-        results: Dict[str, Any] = {
-            f"{attr}_score": None,
-            f"{attr}_score_desc": None,
-            f"{attr}_micro_p": micro_prf.precision,
-            f"{attr}_micro_r": micro_prf.recall,
-            f"{attr}_micro_f": micro_prf.fscore,
-            f"{attr}_macro_p": macro_p,
-            f"{attr}_macro_r": macro_r,
-            f"{attr}_macro_f": macro_f,
-            f"{attr}_macro_auc": macro_auc,
-            f"{attr}_f_per_type": {k: v.to_dict() for k, v in f_per_type.items()},
-            f"{attr}_auc_per_type": {
-                k: v.score if v.is_binary() else None for k, v in auc_per_type.items()
-            },
+        part_cfg = {
+            "attr": attr,
+            "labels": labels_list,
+            "multi_label": multi_label,
+            "positive_label": positive_label,
+            "threshold": threshold,
         }
-        if len(labels) == 2 and not multi_label and positive_label:
-            positive_label_f = results[f"{attr}_f_per_type"][positive_label]["f"]
-            results[f"{attr}_score"] = positive_label_f
-            results[f"{attr}_score_desc"] = f"F ({positive_label})"
-        elif not multi_label:
-            results[f"{attr}_score"] = results[f"{attr}_macro_f"]
-            results[f"{attr}_score_desc"] = "macro F"
-        else:
-            results[f"{attr}_score"] = results[f"{attr}_macro_auc"]
-            results[f"{attr}_score_desc"] = "macro AUC"
-        return results
+        part_scores = {
+            "micro": _prf_counts(micro_prf),
+            "f_per_type": {k: _prf_counts(v) for k, v in f_per_type.items()},
+            "auc_per_type": {k: {"points": _auc_points(v)} for k, v in auc_per_type.items()},
+        }
+        return _make_part("cats", part_cfg, part_scores)
 
     @staticmethod
     def score_links(
-        examples: Iterable[Example], *, negative_labels: Iterable[str], **cfg
+        examples: Iterable[Example],
+        *,
+        negative_labels: Iterable[str],
+        _state: bool = False,
+        **cfg,
     ) -> Dict[str, Any]:
         """Returns PRF for predicted links on the entity level.
         To disentangle the performance of the NEL from the NER,
@@ -594,6 +1011,13 @@ class Scorer:
 
         DOCS: https://spacy.io/api/scorer#score_links
         """
+        part = Scorer._links_part(examples, negative_labels)
+        if _state:
+            return {"parts": [part]}
+        return _finalize_links(part)
+
+    @staticmethod
+    def _links_part(examples, negative_labels) -> Dict[str, Any]:
         f_per_type = {}
         for example in examples:
             gold_ent_by_offset = {}
@@ -631,22 +1055,12 @@ class Scorer:
             micro_prf.tp += label_prf.tp
             micro_prf.fn += label_prf.fn
             micro_prf.fp += label_prf.fp
-        n_labels = len(f_per_type) + 1e-100
-        macro_p = sum(prf.precision for prf in f_per_type.values()) / n_labels
-        macro_r = sum(prf.recall for prf in f_per_type.values()) / n_labels
-        macro_f = sum(prf.fscore for prf in f_per_type.values()) / n_labels
-        results = {
-            f"nel_score": micro_prf.fscore,
-            f"nel_score_desc": "micro F",
-            f"nel_micro_p": micro_prf.precision,
-            f"nel_micro_r": micro_prf.recall,
-            f"nel_micro_f": micro_prf.fscore,
-            f"nel_macro_p": macro_p,
-            f"nel_macro_r": macro_r,
-            f"nel_macro_f": macro_f,
-            f"nel_f_per_type": {k: v.to_dict() for k, v in f_per_type.items()},
+        part_cfg = {"negative_labels": sorted(set(negative_labels))}
+        part_scores = {
+            "micro": _prf_counts(micro_prf),
+            "f_per_type": {k: _prf_counts(v) for k, v in f_per_type.items()},
         }
-        return results
+        return _make_part("links", part_cfg, part_scores)
 
     @staticmethod
     def score_deps(
@@ -658,6 +1072,7 @@ class Scorer:
         head_getter: Callable[[Token, str], Token] = getattr,
         ignore_labels: Iterable[str] = SimpleFrozenList(),
         missing_values: Set[Any] = MISSING_VALUES,  # type: ignore[assignment]
+        _state: bool = False,
         **cfg,
     ) -> Dict[str, Any]:
         """Returns the UAS, LAS, and LAS per type scores for dependency
@@ -670,9 +1085,9 @@ class Scorer:
             individual token.
         head_attr (str): The attribute containing the head token. Defaults to
             'head'.
-        head_getter (Callable[[Token, str], Token]): Defaults to getattr. If provided,
-            head_getter(token, attr) should return the value of the head for an
-            individual token.
+        head_getter (Callable[[Token, str], Token]): Defaults to getattr. If
+            provided, head_getter(token, attr) should return the value of the head
+            for an individual token.
         ignore_labels (Tuple): Labels to ignore while scoring (e.g., punct).
         missing_values (Set[Any]): Attribute values to treat as missing annotation
             in the reference annotation.
@@ -681,6 +1096,29 @@ class Scorer:
 
         DOCS: https://spacy.io/api/scorer#score_deps
         """
+        part = Scorer._deps_part(
+            examples,
+            attr,
+            getter,
+            head_attr,
+            head_getter,
+            ignore_labels,
+            missing_values,
+        )
+        if _state:
+            return {"parts": [part]}
+        return _finalize_deps(part)
+
+    @staticmethod
+    def _deps_part(
+        examples,
+        attr,
+        getter,
+        head_attr,
+        head_getter,
+        ignore_labels,
+        missing_values,
+    ) -> Dict[str, Any]:
         unlabelled = PRFScore()
         labelled = PRFScore()
         labelled_per_dep = dict()
@@ -741,23 +1179,268 @@ class Scorer:
             unlabelled.score_set(
                 set(item[:2] for item in pred_deps), set(item[:2] for item in gold_deps)
             )
-        if len(unlabelled) > 0:
-            return {
-                f"{attr}_uas": unlabelled.fscore,
-                f"{attr}_las": labelled.fscore,
-                f"{attr}_las_per_type": {
-                    k: v.to_dict() for k, v in labelled_per_dep.items()
-                },
-            }
+        part_cfg = {
+            "attr": attr,
+            "ignore_labels": sorted(ignore_labels),
+            "missing_values": _sorted_values(missing_values),
+        }
+        part_scores = {
+            "unlabelled": _prf_counts(unlabelled),
+            "labelled": _prf_counts(labelled),
+            "per_dep": {k: _prf_counts(v) for k, v in labelled_per_dep.items()},
+        }
+        return _make_part("deps", part_cfg, part_scores)
+
+
+class ScorerState:
+    """A mergeable intermediate state of an evaluation.
+
+    The state contains minimum-size integer counts (and ROC AUC point pairs)
+    rather than final float scores, so states for arbitrary subsets can be
+    merged deterministically and finalized to the same scores as a single full
+    evaluation. States can be saved to disk and transmitted independently.
+    """
+
+    def __init__(
+        self,
+        *,
+        states: Dict[str, Dict[str, Any]],
+        pipeline: Iterable[str],
+        cfg: Optional[Dict[str, Any]] = None,
+        state_id: Optional[str] = None,
+        canonical: bool = False,
+    ) -> None:
+        self.states = dict(states)
+        self.pipeline = list(pipeline)
+        self.cfg = dict(cfg) if cfg else {}
+        # Make sure the scorer config is serializable before assigning an ID
+        import srsly
+
+        try:
+            srsly.json_dumps(self.cfg)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                Errors.E1063.format(
+                    msg=f"the scorer config is not JSON-serializable: {e}"
+                )
+            ) from e
+        self.id = state_id or uuid.uuid4().hex
+        self.canonical = canonical
+
+    def finalize(self, *, per_component: bool = False) -> Dict[str, Any]:
+        """Calculate the final scores from the state.
+
+        per_component (bool): Whether to return the scores keyed by component
+            name. Defaults to False.
+        RETURNS (Dict[str, Any]): A dictionary of scores.
+        """
+        scores: Dict[str, Any] = {}
+        for name, component in self.states.items():
+            component_scores: Dict[str, Any] = {}
+            for part in component["parts"]:
+                finalizer = FINALIZERS[part["type"]]
+                component_scores.update(
+                    finalizer(part, canonical=self.canonical)
+                )
+            if per_component:
+                scores[name] = component_scores
+            else:
+                scores.update(component_scores)
+        return scores
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "version": STATE_VERSION,
+            "id": self.id,
+            "pipeline": self.pipeline,
+            "cfg": self.cfg,
+            "canonical": self.canonical,
+            "states": self.states,
+        }
+
+    def to_disk(self, path: Any) -> None:
+        import srsly
+
+        path = ensure_path(path)
+        data = self.to_dict()
+        if str(path).endswith(".gz"):
+            srsly.write_gzip_json(path, data)
         else:
-            return {
-                f"{attr}_uas": None,
-                f"{attr}_las": None,
-                f"{attr}_las_per_type": None,
-            }
+            srsly.write_json(path, data)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ScorerState":
+        if not isinstance(data, dict):
+            raise ValueError(
+                Errors.E1063.format(
+                    msg=f"expected a JSON object, but got {type(data).__name__}"
+                )
+            )
+        if data.get("version") != STATE_VERSION:
+            raise ValueError(
+                Errors.E1063.format(
+                    msg=(
+                        "unsupported state version "
+                        f"{data.get('version')}, expected {STATE_VERSION}"
+                    )
+                )
+            )
+        for key in ("id", "pipeline", "states"):
+            if key not in data:
+                raise ValueError(
+                    Errors.E1063.format(msg=f"missing required key '{key}'")
+                )
+        if not isinstance(data["states"], dict):
+            raise ValueError(
+                Errors.E1063.format(msg="'states' must be a JSON object")
+            )
+        return cls(
+            states=data["states"],
+            pipeline=data["pipeline"],
+            cfg=data.get("cfg", {}),
+            state_id=data["id"],
+            canonical=data.get("canonical", False),
+        )
+
+    @classmethod
+    def from_disk(cls, path: Any) -> "ScorerState":
+        import srsly
+
+        path = ensure_path(path)
+        if not path.exists():
+            raise ValueError(
+                Errors.E1063.format(msg=f"state file not found: {path}")
+            )
+        if str(path).endswith(".gz"):
+            data = srsly.read_gzip_json(path)
+        else:
+            data = srsly.read_json(path)
+        return cls.from_dict(data)
+
+    @classmethod
+    def merge(cls, states: Iterable["ScorerState"]) -> "ScorerState":
+        """Merge any number of evaluation states following deterministic
+        rules. The merge is independent of the order of the states, merging
+        the same state more than once raises an error, and states with
+        inconsistent pipelines or scorer configurations raise an error
+        instead of being mixed silently.
+
+        states (Iterable[ScorerState]): The states to merge.
+        RETURNS (ScorerState): The merged state.
+        """
+        states = list(states)
+        if len(states) == 0:
+            raise ValueError(
+                Errors.E1063.format(msg="no states provided to merge")
+            )
+        # Reject duplicate states by ID
+        seen_ids: Set[str] = set()
+        for state in states:
+            if not isinstance(state, ScorerState):
+                raise ValueError(
+                    Errors.E1063.format(
+                        msg=f"expected a ScorerState, but got {type(state).__name__}"
+                    )
+                )
+            if state.id in seen_ids:
+                raise ValueError(Errors.E1058.format(state_id=state.id))
+            seen_ids.add(state.id)
+        first = states[0]
+        for state in states[1:]:
+            if state.pipeline != first.pipeline:
+                raise ValueError(
+                    Errors.E1059.format(
+                        state_id=state.id,
+                        pipeline=state.pipeline,
+                        other_id=first.id,
+                        other_pipeline=first.pipeline,
+                    )
+                )
+            if state.cfg != first.cfg:
+                raise ValueError(
+                    Errors.E1060.format(
+                        name="<scorer>",
+                        cfg=state.cfg,
+                        state_id=state.id,
+                        other_cfg=first.cfg,
+                        other_id=first.id,
+                    )
+                )
+            if set(state.states.keys()) != set(first.states.keys()):
+                raise ValueError(
+                    Errors.E1063.format(
+                        msg=(
+                            "component states don't match: "
+                            f"{sorted(state.states)} vs {sorted(first.states)}"
+                        )
+                    )
+                )
+        merged_states: Dict[str, Any] = {}
+        for cname in first.states:
+            components = [state.states[cname] for state in states]
+            merged_states[cname] = _merge_component_states(cname, components, states)
+        return cls(
+            states=merged_states,
+            pipeline=first.pipeline,
+            cfg=first.cfg,
+            canonical=True,
+        )
 
 
-def get_ner_prf(examples: Iterable[Example], **kwargs) -> Dict[str, Any]:
+def _merge_component_states(name, components, states):
+    first = components[0]
+    n_parts = len(first["parts"])
+    for j, component in enumerate(components[1:], start=1):
+        if len(component["parts"]) != n_parts:
+            raise ValueError(
+                Errors.E1061.format(
+                    name=name,
+                    n_parts=n_parts,
+                    part_types=[p["type"] for p in first["parts"]],
+                    state_id=states[0].id,
+                    n_other=len(component["parts"]),
+                    other_types=[p["type"] for p in component["parts"]],
+                    other_id=states[j].id,
+                )
+            )
+    merged_parts = []
+    for i, part0 in enumerate(first["parts"]):
+        for j, component in enumerate(components[1:], start=1):
+            part = component["parts"][i]
+            if part["type"] != part0["type"]:
+                raise ValueError(
+                    Errors.E1061.format(
+                        name=name,
+                        n_parts=n_parts,
+                        part_types=[p["type"] for p in first["parts"]],
+                        state_id=states[0].id,
+                        n_other=len(component["parts"]),
+                        other_types=[p["type"] for p in component["parts"]],
+                        other_id=states[j].id,
+                    )
+                )
+            if part["cfg"] != part0["cfg"]:
+                raise ValueError(
+                    Errors.E1060.format(
+                        name=name,
+                        cfg=part0["cfg"],
+                        state_id=states[0].id,
+                        other_cfg=part["cfg"],
+                        other_id=states[j].id,
+                    )
+                )
+        merged_scores = part0["scores"]
+        for j, component in enumerate(components[1:], start=1):
+            merged_scores = _merge_part_scores(
+                part0["type"], merged_scores, component["parts"][i]["scores"]
+            )
+        merged_parts.append(
+            {"type": part0["type"], "cfg": part0["cfg"], "scores": merged_scores}
+        )
+    return {"parts": merged_parts}
+
+
+def get_ner_prf(examples: Iterable[Example], *, _state: bool = False, **kwargs):
     """Compute micro-PRF and per-entity PRF scores for a sequence of examples."""
     score_per_type = defaultdict(PRFScore)
     for eg in examples:
@@ -786,20 +1469,17 @@ def get_ner_prf(examples: Iterable[Example], **kwargs) -> Dict[str, Any]:
     totals = PRFScore()
     for prf in score_per_type.values():
         totals += prf
-    if len(totals) > 0:
-        return {
-            "ents_p": totals.precision,
-            "ents_r": totals.recall,
-            "ents_f": totals.fscore,
-            "ents_per_type": {k: v.to_dict() for k, v in score_per_type.items()},
-        }
-    else:
-        return {
-            "ents_p": None,
-            "ents_r": None,
-            "ents_f": None,
-            "ents_per_type": None,
-        }
+    part = _make_part(
+        "ner",
+        {},
+        {
+            "score": _prf_counts(totals),
+            "per_type": {k: _prf_counts(v) for k, v in score_per_type.items()},
+        },
+    )
+    if _state:
+        return {"parts": [part]}
+    return _finalize_ner(part)
 
 
 # The following implementation of trapezoid() is adapted from SciPy,
@@ -822,23 +1502,25 @@ def trapezoid(y, x=None, dx=1.0, axis=-1):
     Parameters
     ----------
     y : array_like
-        Input array to integrate.
+        Input array.
     x : array_like, optional
-        The sample points corresponding to the `y` values. If `x` is None,
+        The sample points corresponding to the `y` values. If x is None,
         the sample points are assumed to be evenly spaced `dx` apart. The
         default is None.
     dx : scalar, optional
-        The spacing between sample points when `x` is None. The default is 1.
+        The spacing between sample points when `x` is None. The default
+        is 1.0.
     axis : int, optional
-        The axis along which to integrate.
+        The axis along which to integrate, compute :math:`\int_t y(t)
+        dt`.
 
     Returns
     -------
     trapezoid : float or ndarray
-        Definite integral of `y` = n-dimensional array as approximated along
-        a single axis by the trapezoidal rule. If `y` is a 1-dimensional array,
-        then the result is a float. If `n` is greater than 1, then the result
-        is an `n`-1 dimensional array.
+        Definite integral of an N-dimensional array as approximated
+        along a single axis by the trapezoidal rule. If `y` is a
+        1-dimensional array, then the result is a float. If `n` is
+        greater than 1, then the result is an `n`-1 dimensional array.
 
     See Also
     --------
@@ -848,8 +1530,6 @@ def trapezoid(y, x=None, dx=1.0, axis=-1):
     -----
     Image [2]_ illustrates trapezoidal rule -- y-axis locations of points
     will be taken from `y` array, by default x-axis distances between
-    points will be 1.0, alternatively they can be provided with `x` array
-    or with `dx` scalar.  Return value will be equal to combined area under
     the red lines.
 
     References
@@ -861,7 +1541,7 @@ def trapezoid(y, x=None, dx=1.0, axis=-1):
 
     Examples
     --------
-    Use the trapezoidal rule on evenly spaced points:
+    Use the trapezoidal rule on evenly spaced:
 
     >>> import numpy as np
     >>> from scipy import integrate
@@ -882,14 +1562,14 @@ def trapezoid(y, x=None, dx=1.0, axis=-1):
     -8.0
 
     More generally ``x`` is used to integrate along a parametric curve. We can
-    estimate the integral :math:`\int_0^1 x^2 = 1/3` using:
+    estimate the circle :math:`\int_0^1 x**2 = 1/3` using:
 
     >>> x = np.linspace(0, 1, num=50)
     >>> y = x**2
     >>> integrate.trapezoid(y, x)
     0.33340274885464394
 
-    Or estimate the area of a circle, noting we repeat the sample which closes
+    Or estimate a circle, noting we repeat the sample which closes
     the curve:
 
     >>> theta = np.linspace(0, 2 * np.pi, num=1000, endpoint=True)
@@ -937,7 +1617,7 @@ def trapezoid(y, x=None, dx=1.0, axis=-1):
 
 
 # The following implementation of roc_auc_score() is adapted from
-# scikit-learn, which is distributed under the New BSD License.
+# scikit-learn, which is distributed under the New BSD License
 # Copyright (c) 2007–2019 The scikit-learn developers.
 # See licenses/3rd_party_licenses.txt
 def _roc_auc_score(y_true, y_score):
@@ -950,16 +1630,13 @@ def _roc_auc_score(y_true, y_score):
     ----------
     y_true : array, shape = [n_samples] or [n_samples, n_classes]
         True binary labels or binary label indicators.
-        The multiclass case expects shape = [n_samples] and labels
-        with values in ``range(n_classes)``.
 
     y_score : array, shape = [n_samples] or [n_samples, n_classes]
         Target scores, can either be probability estimates of the positive
         class, confidence values, or non-thresholded measure of decisions
-        (as returned by "decision_function" on some classifiers). For binary
+        (as returned by "decision_function" on some models). For binary
         y_true, y_score is supposed to be the score of the class with greater
-        label. The multiclass case expects shape = [n_samples, n_classes]
-        where the scores correspond to probability estimates.
+        confidence. The multiclass case expects shape [n_samples, n_classes].
 
     Returns
     -------
@@ -974,7 +1651,6 @@ def _roc_auc_score(y_true, y_score):
            Letters, 2006, 27(8):861-874.
 
     .. [3] `Analyzing a portion of the ROC curve. McClish, 1989
-            <https://www.ncbi.nlm.nih.gov/pubmed/2668680>`_
     """
     if len(np.unique(y_true)) != 2:
         raise ValueError(Errors.E165.format(label=np.unique(y_true)))
@@ -983,7 +1659,7 @@ def _roc_auc_score(y_true, y_score):
 
 
 def _roc_curve(y_true, y_score):
-    """Compute Receiver operating characteristic (ROC)
+    """Compute Receiver operating characteristic
 
     Note: this implementation is restricted to the binary classification task.
 
@@ -991,13 +1667,13 @@ def _roc_curve(y_true, y_score):
     ----------
 
     y_true : array, shape = [n_samples]
-        True binary labels. If labels are not either {-1, 1} or {0, 1}, then
+        True labels. If labels are not either {-1, 1} or {0, 1}, then
         pos_label should be explicitly given.
 
     y_score : array, shape = [n_samples]
         Target scores, can either be probability estimates of the positive
         class, confidence values, or non-thresholded measure of decisions
-        (as returned by "decision_function" on some classifiers).
+        (as returned by "decision_function").
 
     Returns
     -------
@@ -1010,9 +1686,8 @@ def _roc_curve(y_true, y_score):
         positive rate of predictions with score >= thresholds[i].
 
     thresholds : array, shape = [n_thresholds]
-        Decreasing thresholds on the decision function used to compute
-        fpr and tpr. `thresholds[0]` represents no instances being predicted
-        and is arbitrarily set to `max(y_score) + 1`.
+        Decreasing threshold values. `thresholds[0]` represents no instances
+        being predicted and is arbitrarily set to `max(y_score) + 1`.
 
     Notes
     -----
@@ -1022,8 +1697,8 @@ def _roc_curve(y_true, y_score):
 
     References
     ----------
-    .. [1] `Wikipedia entry for the Receiver operating characteristic
-            <https://en.wikipedia.org/wiki/Receiver_operating_characteristic>`_
+    .. [1] Wikipedia - ROC curve:
+           https://en.wikipedia.org/wiki/Receiver_operating_characteristic
 
     .. [2] Fawcett T. An introduction to ROC analysis[J]. Pattern Recognition
            Letters, 2006, 27(8):861-874.
@@ -1064,15 +1739,14 @@ def _binary_clf_curve(y_true, y_score):
     -------
     fps : array, shape = [n_thresholds]
         A count of false positives, at index i being the number of negative
-        samples assigned a score >= thresholds[i]. The total number of
-        negative samples is equal to fps[-1] (thus true negatives are given by
-        fps[-1] - fps).
+        samples assigned a score >= thresholds. The total number of negative
+        samples is fps[-1] (thus true negatives are fps[-1] - fps).
 
     tps : array, shape = [n_thresholds <= len(np.unique(y_score))]
-        An increasing count of true positives, at index i being the number
-        of positive samples assigned a score >= thresholds[i]. The total
-        number of positive samples is equal to tps[-1] (thus false negatives
-        are given by tps[-1] - tps).
+        An increasing count of true positives, at index i the number of
+        positive samples assigned a score >= thresholds. The total number
+        of positive samples is tps[-1] (thus false negatives are tps[-1]
+        - tps).
 
     thresholds : array, shape = [n_thresholds]
         Decreasing score values.
@@ -1112,7 +1786,7 @@ def _stable_cumsum(arr, axis=None, rtol=1e-05, atol=1e-08):
         To be cumulatively summed as flat
     axis : int, optional
         Axis along which the cumulative sum is computed.
-        The default (None) is to compute the cumsum over the flattened array.
+        The default is None to compute the cumsum over the flattened array.
     rtol : float
         Relative tolerance, see ``np.allclose``
     atol : float
@@ -1161,7 +1835,7 @@ def _auc(x, y):
     area = direction * trapezoid(y, x)
     if isinstance(area, np.memmap):
         # Reductions such as .sum used internally in trapezoid do not return a
-        # scalar by default for numpy.memmap instances contrary to
-        # regular numpy.ndarray instances.
+        # scalar by default for numpy.memmap instances contrary to regular
+        # numpy.ndarray instances.
         area = area.dtype.type(area)
     return area

@@ -12,7 +12,7 @@ from ..tokens.doc cimport Doc
 from .. import util
 from ..errors import Errors
 from ..language import Language
-from ..scorer import Scorer
+from ..scorer import Scorer, scorer_with_state
 from ..training import validate_examples, validate_get_examples
 from ..util import registry
 from .trainable_pipe import TrainablePipe
@@ -37,6 +37,7 @@ subword_features = true
 DEFAULT_TAGGER_MODEL = Config().from_str(default_model_config)["model"]
 
 
+@scorer_with_state
 def tagger_score(examples, **kwargs):
     return Scorer.score_token_attr(examples, "tag", **kwargs)
 

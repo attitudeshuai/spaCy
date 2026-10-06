@@ -146,12 +146,23 @@ class Corpus:
         self.shuffle = shuffle
 
     def __call__(self, nlp: "Language") -> Iterator[Example]:
-        """Yield examples from the data.
+        """Yield examples from the data, applying the configured augmenter.
 
         nlp (Language): The current nlp object.
         YIELDS (Example): The examples.
 
         DOCS: https://spacy.io/api/corpus#call
+        """
+        for real_eg in self.iter_examples(nlp):
+            for augmented_eg in self.augmenter(nlp, real_eg):  # type: ignore[operator]
+                yield augmented_eg
+
+    def iter_examples(self, nlp: "Language") -> Iterator[Example]:
+        """Yield the unaugmented examples from the data. The training loop
+        uses this to drive stateful, per-epoch augmentation itself.
+
+        nlp (Language): The current nlp object.
+        YIELDS (Example): The examples without augmentation applied.
         """
         ref_docs = self.read_docbin(nlp.vocab, walk_corpus(self.path, FILE_TYPE))
         if self.shuffle:
@@ -162,9 +173,7 @@ class Corpus:
             examples = self.make_examples_gold_preproc(nlp, ref_docs)
         else:
             examples = self.make_examples(nlp, ref_docs)
-        for real_eg in examples:
-            for augmented_eg in self.augmenter(nlp, real_eg):  # type: ignore[operator]
-                yield augmented_eg
+        yield from examples
 
     def _make_example(
         self, nlp: "Language", reference: Doc, gold_preproc: bool

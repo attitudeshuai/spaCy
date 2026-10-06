@@ -1,5 +1,11 @@
 from .alignment import Alignment  # noqa: F401
-from .augment import dont_augment, orth_variants_augmenter  # noqa: F401
+from .augment import (  # noqa: F401
+    AugmentingScheduler,
+    create_scheduled_augmenter,
+    dont_augment,
+    orth_variants_augmenter,
+    validate_variant,
+)
 from .batchers import minibatch_by_padded_size, minibatch_by_words  # noqa: F401
 from .callbacks import create_copy_from_base_model  # noqa: F401
 from .corpus import Corpus, JsonlCorpus, PlainTextCorpus  # noqa: F401
@@ -19,6 +25,7 @@ from .loggers import console_logger  # noqa: F401
 
 __all__ = [
     "Alignment",
+    "AugmentingScheduler",
     "Corpus",
     "Example",
     "JsonlCorpus",
@@ -27,6 +34,7 @@ __all__ = [
     "biluo_tags_to_spans",
     "biluo_to_iob",
     "create_copy_from_base_model",
+    "create_scheduled_augmenter",
     "docs_to_json",
     "dont_augment",
     "iob_to_biluo",
@@ -40,4 +48,5 @@ __all__ = [
     "tags_to_entities",
     "validate_get_examples",
     "validate_examples",
+    "validate_variant",
 ]

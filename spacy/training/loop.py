@@ -14,6 +14,7 @@ from typing import (
     Optional,
     Tuple,
     Union,
+    cast,
 )
 
 from thinc.api import Config, Optimizer, constant, fix_random_seed, set_gpu_allocator
@@ -22,6 +23,7 @@ from wasabi import Printer
 from ..errors import Errors
 from ..schemas import ConfigSchemaTraining
 from ..util import logger, registry, resolve_dot_names
+from .augment import AugmentingScheduler
 from .example import Example
 
 if TYPE_CHECKING:
@@ -319,6 +321,26 @@ def create_evaluation_callback(
     return evaluate
 
 
+def get_train_augmenter(
+    corpus: Callable[["Language"], Iterable[Example]],
+) -> Optional[AugmentingScheduler]:
+    """Return the enabled AugmentingScheduler attached to a corpus, if any."""
+    augmenter = getattr(corpus, "augmenter", None)
+    if isinstance(augmenter, AugmentingScheduler) and augmenter.enabled:
+        return augmenter
+    return None
+
+
+def iter_base_examples(
+    corpus: Callable[["Language"], Iterable[Example]], nlp: "Language"
+) -> Iterable[Example]:
+    """Iterate the raw corpus examples without applying augmentation. Used
+    by the training loop to drive a stateful scheduler per epoch."""
+    if hasattr(corpus, "iter_examples"):
+        return corpus.iter_examples(nlp)  # type: ignore[attr-defined]
+    return corpus(nlp)
+
+
 def create_train_batches(
     nlp: "Language",
     corpus: Callable[["Language"], Iterable[Example]],
@@ -326,18 +348,43 @@ def create_train_batches(
     max_epochs: int,
 ):
     epoch = 0
+    scheduler = get_train_augmenter(corpus)
+    examples: Optional[List[Union[Example, Tuple[int, Example]]]] = None
     if max_epochs >= 0:
-        examples = list(corpus(nlp))  # type: Iterable[Example]
+        if scheduler is None:
+            examples = list(corpus(nlp))
+        else:
+            # Stable per-input ids are assigned once in raw corpus order and
+            # shuffled together with the examples, so a sample's derived
+            # random stream is independent of its shuffled position.
+            examples = list(enumerate(iter_base_examples(corpus, nlp)))
         if not examples:
             # Raise error if no data
             raise ValueError(Errors.E986)
     while max_epochs < 1 or epoch != max_epochs:
+        epoch_examples: Iterable[Example]
         if max_epochs >= 0:
-            random.shuffle(examples)  # type: ignore
+            assert examples is not None
+            random.shuffle(examples)
+            if scheduler is not None:
+                epoch_examples = scheduler.run_epoch(
+                    nlp, examples, epoch=epoch, n_inputs=len(examples)
+                )
+            else:
+                # No scheduler: examples came from corpus(nlp) directly.
+                epoch_examples = cast(List[Example], examples)
         else:
-            examples = corpus(nlp)
-        for batch in batcher(examples):
+            if scheduler is None:
+                epoch_examples = corpus(nlp)
+            else:
+                epoch_examples = scheduler.run_epoch(
+                    nlp, iter_base_examples(corpus, nlp), epoch=epoch
+                )
+        for batch in batcher(epoch_examples):
             yield epoch, batch
+        if scheduler is not None:
+            # Epoch boundary: report the augmentation counts and quota balance.
+            scheduler.finish_epoch()
         epoch += 1
 
 

@@ -142,6 +142,7 @@ def populate_registry() -> None:
         create_combined_augmenter,
         create_lower_casing_augmenter,
         create_orth_variants_augmenter,
+        create_scheduled_augmenter,
     )
     from .training.batchers import (
         configure_minibatch,
@@ -241,6 +242,7 @@ def populate_registry() -> None:
     registry.augmenters("spacy.combined_augmenter.v1")(create_combined_augmenter)
     registry.augmenters("spacy.lower_case.v1")(create_lower_casing_augmenter)
     registry.augmenters("spacy.orth_variants.v1")(create_orth_variants_augmenter)
+    registry.augmenters("spacy.augmenting_scheduler.v1")(create_scheduled_augmenter)
 
     # Set the flag to indicate that the registry has been populated
     REGISTRY_POPULATED = True

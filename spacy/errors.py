@@ -988,6 +988,24 @@ class Errors(metaclass=ErrorsWithCodes):
     E1057 = ("The `TextCatReduce` architecture must be used with at least one "
              "reduction. Please enable one of `use_reduce_first`, "
              "`use_reduce_last`, `use_reduce_max` or `use_reduce_mean`.")
+    E1058 = ("DocBin version mismatch: the data was written with DocBin format "
+             "version '{found}', but this spaCy installation supports version "
+             "'{supported}'. Upgrade spaCy to read this data.")
+    E1059 = ("DocBin container version mismatch: the file '{path}' was written "
+             "with segmented container version {found}, but this spaCy "
+             "installation supports version {supported}. Upgrade spaCy to read "
+             "this data.")
+    E1060 = ("Error reading segment {index} of the DocBin at {path}: {reason}. "
+             "Re-save the data or configure the reader to skip damaged "
+             "segments with `on_error='skip'`.")
+    E1061 = ("Could not read the DocBin at {path} completely: {reason}. The "
+             "file may be truncated or still being written to.")
+    E1062 = ("Invalid value '{found}' for `on_error`. Expected one of: strict, "
+             "skip.")
+    E1063 = ("'{path}' is not a segmented DocBin container: expected the file "
+             "to start with the bytes {magic}.")
+    E1064 = ("Invalid segment size: {value}. The segment size needs to be a "
+             "positive integer (or 0 to disable segmentation).")
 
 
 # Deprecated model shortcuts, only used in errors and warnings

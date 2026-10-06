@@ -7,7 +7,7 @@ import srsly
 
 from .. import util
 from ..errors import Errors, Warnings
-from ..tokens import Doc, DocBin
+from ..tokens import Doc, DocBinReader
 from ..vocab import Vocab
 from .augment import dont_augment
 from .example import Example
@@ -217,8 +217,10 @@ class Corpus:
         for loc in locs:
             loc = util.ensure_path(loc)
             if loc.parts[-1].endswith(FILE_TYPE):  # type: ignore[union-attr]
-                doc_bin = DocBin().from_disk(loc)
-                docs = doc_bin.get_docs(vocab)
+                # Stream segments instead of loading the whole file into
+                # memory; order and content are unchanged.
+                reader = DocBinReader(loc)
+                docs = reader.get_docs(vocab)
                 for doc in docs:
                     if len(doc):
                         yield doc
